@@ -1,0 +1,8 @@
+.env
+.env.example
+__pycache__/
+*.py[cod]
+venv/
+.pytest_cache/
+.coverage
+*.db
