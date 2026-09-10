@@ -1,11 +1,12 @@
 from fastapi import FastAPI
+
 from app.routers import auth, scan, user
 
 app = FastAPI(title="AI Job Scam Detector")
 
 
-@app.get("/health")
-def health_check():
+@app.get("/health", tags=["Health"])
+def health_check() -> dict[str, str]:
     return {"status": "Healthy"}
 
 
