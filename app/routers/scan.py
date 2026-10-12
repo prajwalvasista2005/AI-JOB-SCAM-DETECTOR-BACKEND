@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, get_db
@@ -46,7 +46,7 @@ def get_scan_by_id_endpoint(
     return scan
 
 
-@router.delete("/{scan_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{scan_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def delete_scan_endpoint(
     scan_id: int,
     db: Session = Depends(get_db),
@@ -58,4 +58,4 @@ def delete_scan_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Scan not found",
         )
-    return None
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
