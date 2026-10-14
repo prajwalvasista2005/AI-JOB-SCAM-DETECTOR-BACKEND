@@ -1,3 +1,4 @@
+import logging
 import re
 from urllib.parse import urlparse
 from sqlalchemy import select
@@ -5,6 +6,9 @@ from sqlalchemy.orm import Session
 
 from app.models.scan import Scan
 from app.schemas.scan import InputType
+from app.services.gemini_service import analyze_job_content
+
+logger = logging.getLogger(__name__)
 
 SCAM_PATTERNS: dict[str, int] = {
     "registration fee": 60,
@@ -107,9 +111,29 @@ def get_verdict(risk_score: int) -> str:
         return "High Risk"
 
 
+
 def create_scan(content: str, user_id: int, db: Session) -> Scan:
     input_type = detect_input_type(content)
-    risk_score = calculate_risk_score(content)
+
+    # Existing rule-based detection
+    rule_score = calculate_risk_score(content)
+
+    # Gemini provides contextual analysis
+    try:
+        gemini_result = analyze_job_content(content)
+        logger.warning("GEMINI_CALL_SUCCEEDED")
+
+        gemini_score = gemini_result["risk_score"]
+
+        # Keep the stronger risk signal; do not add scores together.
+        risk_score = max(rule_score, gemini_score)
+
+    except Exception:
+        logger.exception(
+            "Gemini analysis failed; using rule-based scoring"
+        )
+        risk_score = rule_score
+
     verdict = get_verdict(risk_score)
 
     new_scan = Scan(
@@ -119,6 +143,7 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         risk_score=risk_score,
         verdict=verdict,
     )
+
     try:
         db.add(new_scan)
         db.commit()
