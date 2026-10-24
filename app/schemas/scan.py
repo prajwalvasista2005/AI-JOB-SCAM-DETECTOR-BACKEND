@@ -26,6 +26,20 @@ class ScanRequest(BaseModel):
         return v
 
 
+class JobDetails(BaseModel):
+    company_name: str | None = None
+    job_title: str | None = None
+    salary: str | None = None
+    location: str | None = None
+    employment_type: str | None = None
+    experience_required: str | None = None
+    education_required: str | None = None
+    application_method: str | None = None
+    application_url: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ScanResponse(BaseModel):
     id: int
     input_type: InputType
@@ -35,5 +49,6 @@ class ScanResponse(BaseModel):
     created_at: datetime
     explanation: str | None = None
     indicators: list[str] | None = None
+    job_details: JobDetails | None = None
 
     model_config = ConfigDict(from_attributes=True)

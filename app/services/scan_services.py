@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.models.scan import Scan
 from app.schemas.scan import InputType
-from app.services.gemini_service import analyze_job_content
+from app.services.gemini_service import analyze_job_content, parse_extracted_details
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,7 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
 
     explanation: str | None = None
     indicators: list[str] | None = None
+    job_details: dict[str, str | None] | None = None
 
     # Gemini provides contextual analysis
     try:
@@ -150,6 +151,7 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         risk_score = max(rule_score, gemini_score)
         explanation = gemini_explanation
         indicators = gemini_indicators
+        job_details = parse_extracted_details(gemini_result.get("job_details"))
 
     except Exception:
         logger.exception(
@@ -158,6 +160,7 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         risk_score = rule_score
         explanation = None
         indicators = None
+        job_details = None
 
     verdict = get_verdict(risk_score)
 
@@ -169,6 +172,7 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         verdict=verdict,
         explanation=explanation,
         indicators=indicators,
+        job_details=job_details,
     )
 
     try:

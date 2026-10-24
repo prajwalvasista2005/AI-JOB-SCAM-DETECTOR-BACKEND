@@ -15,9 +15,14 @@ from app.core.database import Base
 from app.core.dependencies import get_current_user
 from app.models import User, Scan
 from app.schemas.auth import Token
-from app.schemas.scan import InputType, ScanRequest, ScanResponse
+from app.schemas.scan import InputType, ScanRequest, ScanResponse, JobDetails
 from app.schemas.user import UserCreate, UserResponse
-from app.services.gemini_service import analyze_job_content
+from app.services.gemini_service import (
+    EXTRACTION_FIELDS,
+    analyze_job_content,
+    extract_job_details,
+    parse_extracted_details,
+)
 from app.services.scan_services import (
     calculate_risk_score,
     detect_input_type,
@@ -124,6 +129,82 @@ class TestSchemas(unittest.TestCase):
         response_model = ScanResponse.model_validate(scan)
         self.assertIsNone(response_model.explanation)
         self.assertIsNone(response_model.indicators)
+
+    def test_job_details_schema(self):
+        details = JobDetails(
+            company_name="Acme Corp",
+            job_title="Software Engineer",
+            salary="$120,000 / year",
+            location="Remote",
+            employment_type="Full-time",
+            experience_required="3+ years",
+            education_required="Bachelor's degree",
+            application_method="Official portal",
+            application_url="https://example.com/apply",
+        )
+        self.assertEqual(details.company_name, "Acme Corp")
+        self.assertEqual(details.job_title, "Software Engineer")
+        self.assertEqual(details.salary, "$120,000 / year")
+        self.assertEqual(details.location, "Remote")
+        self.assertEqual(details.employment_type, "Full-time")
+        self.assertEqual(details.experience_required, "3+ years")
+        self.assertEqual(details.education_required, "Bachelor's degree")
+        self.assertEqual(details.application_method, "Official portal")
+        self.assertEqual(details.application_url, "https://example.com/apply")
+
+        empty_details = JobDetails()
+        for field in [
+            "company_name", "job_title", "salary", "location",
+            "employment_type", "experience_required", "education_required",
+            "application_method", "application_url"
+        ]:
+            self.assertIsNone(getattr(empty_details, field))
+
+    def test_scan_response_with_job_details(self):
+        now = datetime.now(timezone.utc)
+        details_dict = {
+            "company_name": "Tech Corp",
+            "job_title": "Data Analyst",
+            "salary": "$80,000",
+            "location": "New York, NY",
+            "employment_type": "Full-time",
+            "experience_required": "2 years",
+            "education_required": "B.S.",
+            "application_method": "Email",
+            "application_url": "https://example.com/jobs/1",
+        }
+        scan = Scan(
+            id=4,
+            user_id=10,
+            input_type="text",
+            content="Hiring Data Analyst at Tech Corp $80,000",
+            risk_score=15,
+            verdict="Low Risk",
+            explanation="Normal job posting",
+            indicators=[],
+            job_details=details_dict,
+            created_at=now,
+        )
+        response_model = ScanResponse.model_validate(scan)
+        self.assertIsNotNone(response_model.job_details)
+        self.assertEqual(response_model.job_details.company_name, "Tech Corp")
+        self.assertEqual(response_model.job_details.job_title, "Data Analyst")
+        self.assertEqual(response_model.job_details.salary, "$80,000")
+
+    def test_scan_response_with_none_job_details(self):
+        now = datetime.now(timezone.utc)
+        scan = Scan(
+            id=5,
+            user_id=10,
+            input_type="text",
+            content="Hiring Data Analyst at Tech Corp",
+            risk_score=15,
+            verdict="Low Risk",
+            job_details=None,
+            created_at=now,
+        )
+        response_model = ScanResponse.model_validate(scan)
+        self.assertIsNone(response_model.job_details)
 
     def test_user_response_from_orm(self):
         now = datetime.now(timezone.utc)
@@ -540,6 +621,64 @@ class TestGeminiService(unittest.TestCase):
             with self.assertRaises(ValueError):
                 analyze_job_content("Job content")
 
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_with_job_details(self, mock_client):
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "risk_score": 10,
+            "explanation": "Standard recruitment notice with standard details.",
+            "indicators": [],
+            "job_details": {
+                "company_name": "Microsoft",
+                "job_title": "Product Manager",
+                "salary": "$130k",
+                "location": "Redmond, WA",
+                "employment_type": "Full-time",
+                "experience_required": "5 years",
+                "education_required": "BS/BA",
+                "application_method": "Portal",
+                "application_url": "https://careers.microsoft.com",
+            },
+        })
+        mock_client.models.generate_content.return_value = mock_response
+
+        res = analyze_job_content("Job description text")
+        self.assertEqual(res["risk_score"], 10)
+        self.assertIsNotNone(res["job_details"])
+        self.assertEqual(res["job_details"]["company_name"], "Microsoft")
+        self.assertEqual(res["job_details"]["job_title"], "Product Manager")
+
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_resilient_to_malformed_job_details(self, mock_client):
+        # Even if job_details is corrupted, risk analysis must succeed
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "risk_score": 45,
+            "explanation": "Moderate urgency observed.",
+            "indicators": ["urgent hiring"],
+            "job_details": "corrupted string instead of object",
+        })
+        mock_client.models.generate_content.return_value = mock_response
+
+        res = analyze_job_content("Job description text")
+        self.assertEqual(res["risk_score"], 45)
+        self.assertEqual(res["explanation"], "Moderate urgency observed.")
+        self.assertIsNone(res["job_details"])
+
+    @patch("app.services.gemini_service.analyze_job_content")
+    def test_extract_job_details_helper(self, mock_analyze):
+        mock_analyze.return_value = {
+            "risk_score": 0,
+            "explanation": "Clean",
+            "indicators": [],
+            "job_details": {
+                "company_name": "Canonical",
+                "job_title": "Linux Engineer",
+            },
+        }
+        details = extract_job_details("Some content")
+        self.assertEqual(details["company_name"], "Canonical")
+
 
 class TestScanWorkflow(unittest.TestCase):
     def setUp(self):
@@ -696,6 +835,236 @@ class TestScanWorkflow(unittest.TestCase):
         with self.assertRaises(HTTPException) as ctx:
             get_scan_by_id_endpoint(scan_id=scan.id, db=self.db, current_user=u2)
         self.assertEqual(ctx.exception.status_code, 404)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_create_scan_persists_and_retrieves_job_details(self, mock_analyze):
+        mock_analyze.return_value = {
+            "risk_score": 15,
+            "explanation": "Legitimate recruitment offer with verifiable details.",
+            "indicators": [],
+            "job_details": {
+                "company_name": "Datadog",
+                "job_title": "Site Reliability Engineer",
+                "salary": "$150,000",
+                "location": "Boston, MA",
+                "employment_type": "Full-time",
+                "experience_required": "3+ years",
+                "education_required": "Bachelor's",
+                "application_method": "Careers page",
+                "application_url": "https://careers.datadoghq.com/123",
+            },
+        }
+        content = "We are hiring a Site Reliability Engineer at Datadog in Boston."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertIsNotNone(scan.job_details)
+        self.assertEqual(scan.job_details["company_name"], "Datadog")
+        self.assertEqual(scan.job_details["job_title"], "Site Reliability Engineer")
+        self.assertEqual(scan.job_details["salary"], "$150,000")
+        self.assertEqual(scan.job_details["application_url"], "https://careers.datadoghq.com/123")
+
+        # Persistence check
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.job_details, scan.job_details)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_create_scan_gemini_failure_leaves_job_details_none(self, mock_analyze):
+        mock_analyze.side_effect = RuntimeError("Gemini offline")
+        content = "Urgent hiring for data entry role with guaranteed job."
+        # Rule score: urgent hiring (10) + guaranteed job (25) = 35 -> Medium Risk
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 35)
+        self.assertEqual(scan.verdict, "Medium Risk")
+        self.assertIsNone(scan.explanation)
+        self.assertIsNone(scan.indicators)
+        self.assertIsNone(scan.job_details)
+
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertIsNone(fetched.job_details)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_create_scan_malformed_extraction_retains_risk_score(self, mock_analyze):
+        mock_analyze.return_value = {
+            "risk_score": 75,
+            "explanation": "Advance fee scam detected.",
+            "indicators": ["registration fee"],
+            "job_details": 1234567,  # completely malformed
+        }
+        content = "Pay a registration fee to secure your job."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 75)
+        self.assertEqual(scan.explanation, "Advance fee scam detected.")
+        self.assertEqual(scan.indicators, ["registration fee"])
+        self.assertIsNone(scan.job_details)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_scan_endpoints_serialize_job_details(self, mock_analyze):
+        mock_analyze.return_value = {
+            "risk_score": 20,
+            "explanation": "Posting with standard job details.",
+            "indicators": [],
+            "job_details": {
+                "company_name": "Shopify",
+                "job_title": "Developer",
+                "salary": "$110,000",
+                "location": "Remote",
+                "employment_type": "Full-time",
+                "experience_required": "2 years",
+                "education_required": "B.Sc",
+                "application_method": "Website",
+                "application_url": "https://shopify.com/careers",
+            },
+        }
+        # 1. POST /scan/
+        req = ScanRequest(content="Job offer for Developer at Shopify with competitive benefits.")
+        create_res = create_scan_endpoint(scan_request=req, db=self.db, current_user=self.user)
+        self.assertIsNotNone(create_res.job_details)
+        self.assertEqual(create_res.job_details["company_name"], "Shopify")
+        create_schema = ScanResponse.model_validate(create_res)
+        self.assertIsNotNone(create_schema.job_details)
+        self.assertEqual(create_schema.job_details.company_name, "Shopify")
+        self.assertEqual(create_schema.job_details.salary, "$110,000")
+
+        # 2. GET /scan/
+        list_res = get_user_scans_endpoint(db=self.db, current_user=self.user)
+        self.assertEqual(len(list_res), 1)
+        self.assertIsNotNone(list_res[0].job_details)
+        self.assertEqual(list_res[0].job_details["company_name"], "Shopify")
+        list_schema = ScanResponse.model_validate(list_res[0])
+        self.assertEqual(list_schema.job_details.company_name, "Shopify")
+
+        # 3. GET /scan/{scan_id}
+        get_res = get_scan_by_id_endpoint(scan_id=create_res.id, db=self.db, current_user=self.user)
+        self.assertIsNotNone(get_res.job_details)
+        self.assertEqual(get_res.job_details["job_title"], "Developer")
+        get_schema = ScanResponse.model_validate(get_res)
+        self.assertEqual(get_schema.job_details.job_title, "Developer")
+
+    def test_legacy_scan_with_null_job_details_readable(self):
+        # Simulate legacy scan created before Phase 2 where job_details is NULL in the DB
+        scan = Scan(
+            user_id=self.user.id,
+            input_type="text",
+            content="Legacy job post without extracted details.",
+            risk_score=20,
+            verdict="Low Risk",
+            explanation="Old explanation",
+            indicators=[],
+            job_details=None,
+        )
+        self.db.add(scan)
+        self.db.commit()
+        self.db.refresh(scan)
+
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertIsNone(fetched.job_details)
+
+        response_model = ScanResponse.model_validate(fetched)
+        self.assertIsNone(response_model.job_details)
+
+
+class TestExtractionLogic(unittest.TestCase):
+    def test_parse_extracted_details_all_valid_fields(self):
+        raw = {
+            "company_name": "  Stripe, Inc.  ",
+            "job_title": "  Backend Engineer ",
+            "salary": "$140,000 - $160,000 USD",
+            "location": "Remote - US",
+            "employment_type": "Full-time",
+            "experience_required": "4+ years in Python",
+            "education_required": "BS in Computer Science or equivalent",
+            "application_method": "Official Portal",
+            "application_url": "https://stripe.com/jobs/123",
+        }
+        parsed = parse_extracted_details(raw)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["company_name"], "Stripe, Inc.")
+        self.assertEqual(parsed["job_title"], "Backend Engineer")
+        self.assertEqual(parsed["salary"], "$140,000 - $160,000 USD")
+        self.assertEqual(parsed["location"], "Remote - US")
+        self.assertEqual(parsed["employment_type"], "Full-time")
+        self.assertEqual(parsed["experience_required"], "4+ years in Python")
+        self.assertEqual(parsed["education_required"], "BS in Computer Science or equivalent")
+        self.assertEqual(parsed["application_method"], "Official Portal")
+        self.assertEqual(parsed["application_url"], "https://stripe.com/jobs/123")
+
+    def test_parse_extracted_details_missing_and_null_strings(self):
+        raw = {
+            "company_name": "N/A",
+            "job_title": "Software Developer",
+            "salary": "not specified",
+            "location": "none",
+            "employment_type": "  ",
+            "experience_required": "unspecified",
+            "education_required": "null",
+            "application_method": "UNKNOWN",
+            # application_url missing completely
+        }
+        parsed = parse_extracted_details(raw)
+        self.assertIsNotNone(parsed)
+        self.assertIsNone(parsed["company_name"])
+        self.assertEqual(parsed["job_title"], "Software Developer")
+        self.assertIsNone(parsed["salary"])
+        self.assertIsNone(parsed["location"])
+        self.assertIsNone(parsed["employment_type"])
+        self.assertIsNone(parsed["experience_required"])
+        self.assertIsNone(parsed["education_required"])
+        self.assertIsNone(parsed["application_method"])
+        self.assertIsNone(parsed["application_url"])
+
+    def test_parse_extracted_details_salary_preservation(self):
+        # Salary amounts, currencies, and pay periods must never be calculated or converted
+        currencies = [
+            "£35,000 - £45,000 / annum",
+            "€2,500/month",
+            "$20 - $25 per hour",
+            "12-15 LPA (INR)",
+            "Competitive salary + equity",
+        ]
+        for sal in currencies:
+            parsed = parse_extracted_details({"salary": sal})
+            self.assertEqual(parsed["salary"], sal)
+
+    def test_parse_extracted_details_invalid_types_normalized_to_none(self):
+        raw = {
+            "company_name": 12345,
+            "job_title": ["Engineer"],
+            "salary": True,
+            "location": False,
+            "employment_type": {"type": "Full-time"},
+            "experience_required": None,
+            "education_required": None,
+            "application_method": None,
+            "application_url": None,
+        }
+        parsed = parse_extracted_details(raw)
+        self.assertIsNotNone(parsed)
+        self.assertIsNone(parsed["company_name"])
+        self.assertIsNone(parsed["job_title"])
+        self.assertIsNone(parsed["salary"])
+        self.assertIsNone(parsed["location"])
+        self.assertIsNone(parsed["employment_type"])
+
+    def test_parse_extracted_details_malformed_input(self):
+        for bad in [None, "string", 123, True, [1, 2, 3]]:
+            self.assertIsNone(parse_extracted_details(bad))
+
+    def test_parse_extracted_details_nested_object_unwrapping(self):
+        raw = {
+            "job_details": {
+                "company_name": "OpenAI",
+                "job_title": "Research Scientist",
+            }
+        }
+        parsed = parse_extracted_details(raw)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["company_name"], "OpenAI")
+        self.assertEqual(parsed["job_title"], "Research Scientist")
 
 
 if __name__ == "__main__":
