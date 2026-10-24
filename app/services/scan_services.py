@@ -118,21 +118,46 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
     # Existing rule-based detection
     rule_score = calculate_risk_score(content)
 
+    explanation: str | None = None
+    indicators: list[str] | None = None
+
     # Gemini provides contextual analysis
     try:
         gemini_result = analyze_job_content(content)
-        logger.warning("GEMINI_CALL_SUCCEEDED")
+        if not isinstance(gemini_result, dict):
+            raise ValueError("Gemini analysis returned unexpected format")
 
-        gemini_score = gemini_result["risk_score"]
+        gemini_score = gemini_result.get("risk_score")
+        if (
+            isinstance(gemini_score, bool)
+            or not isinstance(gemini_score, int)
+            or not 0 <= gemini_score <= 100
+        ):
+            raise ValueError("Gemini returned an invalid risk score")
+
+        gemini_explanation = gemini_result.get("explanation")
+        if not isinstance(gemini_explanation, str):
+            raise ValueError("Gemini returned an invalid explanation")
+
+        gemini_indicators = gemini_result.get("indicators")
+        if (
+            not isinstance(gemini_indicators, list)
+            or not all(isinstance(item, str) for item in gemini_indicators)
+        ):
+            raise ValueError("Gemini returned invalid indicators")
 
         # Keep the stronger risk signal; do not add scores together.
         risk_score = max(rule_score, gemini_score)
+        explanation = gemini_explanation
+        indicators = gemini_indicators
 
     except Exception:
         logger.exception(
             "Gemini analysis failed; using rule-based scoring"
         )
         risk_score = rule_score
+        explanation = None
+        indicators = None
 
     verdict = get_verdict(risk_score)
 
@@ -142,6 +167,8 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         content=content,
         risk_score=risk_score,
         verdict=verdict,
+        explanation=explanation,
+        indicators=indicators,
     )
 
     try:

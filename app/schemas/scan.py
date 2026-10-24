@@ -33,5 +33,7 @@ class ScanResponse(BaseModel):
     risk_score: int
     verdict: str
     created_at: datetime
+    explanation: str | None = None
+    indicators: list[str] | None = None
 
     model_config = ConfigDict(from_attributes=True)

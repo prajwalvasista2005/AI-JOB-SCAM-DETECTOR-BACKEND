@@ -1,4 +1,6 @@
+import json
 import unittest
+from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone, timedelta
 from jose import jwt
 from pydantic import ValidationError
@@ -15,6 +17,7 @@ from app.models import User, Scan
 from app.schemas.auth import Token
 from app.schemas.scan import InputType, ScanRequest, ScanResponse
 from app.schemas.user import UserCreate, UserResponse
+from app.services.gemini_service import analyze_job_content
 from app.services.scan_services import (
     calculate_risk_score,
     detect_input_type,
@@ -25,7 +28,12 @@ from app.services.scan_services import (
     delete_scan,
 )
 from app.services.user_services import create_user, authenticate_user
-from app.routers.scan import delete_scan_endpoint
+from app.routers.scan import (
+    create_scan_endpoint,
+    get_user_scans_endpoint,
+    get_scan_by_id_endpoint,
+    delete_scan_endpoint,
+)
 from app.main import app
 
 
@@ -76,6 +84,46 @@ class TestSchemas(unittest.TestCase):
         self.assertEqual(response_model.input_type, InputType.TEXT)
         self.assertEqual(response_model.risk_score, 25)
         self.assertEqual(response_model.verdict, "Low Risk")
+
+    def test_scan_response_with_gemini_fields(self):
+        now = datetime.now(timezone.utc)
+        scan = Scan(
+            id=2,
+            user_id=10,
+            input_type="text",
+            content="Urgent hiring for data entry role whatsapp only",
+            risk_score=75,
+            verdict="High Risk",
+            explanation="Posting requests communication exclusively via unofficial channels.",
+            indicators=["whatsapp only", "urgent hiring"],
+            created_at=now,
+        )
+        response_model = ScanResponse.model_validate(scan)
+        self.assertEqual(response_model.id, 2)
+        self.assertEqual(response_model.risk_score, 75)
+        self.assertEqual(response_model.verdict, "High Risk")
+        self.assertEqual(
+            response_model.explanation,
+            "Posting requests communication exclusively via unofficial channels.",
+        )
+        self.assertEqual(response_model.indicators, ["whatsapp only", "urgent hiring"])
+
+    def test_scan_response_with_none_gemini_fields(self):
+        now = datetime.now(timezone.utc)
+        scan = Scan(
+            id=3,
+            user_id=10,
+            input_type="text",
+            content="Urgent hiring for data entry role whatsapp only",
+            risk_score=25,
+            verdict="Low Risk",
+            explanation=None,
+            indicators=None,
+            created_at=now,
+        )
+        response_model = ScanResponse.model_validate(scan)
+        self.assertIsNone(response_model.explanation)
+        self.assertIsNone(response_model.indicators)
 
     def test_user_response_from_orm(self):
         now = datetime.now(timezone.utc)
@@ -277,7 +325,8 @@ class TestDatabaseServices(unittest.TestCase):
         non_user = authenticate_user("nobody@example.com", "Password123", self.db)
         self.assertIsNone(non_user)
 
-    def test_scan_services_and_idor(self):
+    @patch("app.services.scan_services.analyze_job_content", side_effect=Exception("Gemini offline"))
+    def test_scan_services_and_idor(self, mock_analyze):
         u1 = create_user(UserCreate(email="u1@example.com", password="Password123"), self.db)
         u2 = create_user(UserCreate(email="u2@example.com", password="Password123"), self.db)
 
@@ -307,9 +356,8 @@ class TestDatabaseServices(unittest.TestCase):
         self.assertTrue(own_delete)
         self.assertIsNone(get_scan_by_id(scan1.id, u1.id, self.db))
 
-    def test_database_error_rollbacks(self):
-        from unittest.mock import MagicMock
-
+    @patch("app.services.scan_services.analyze_job_content", side_effect=Exception("Gemini offline"))
+    def test_database_error_rollbacks(self, mock_analyze):
         # create_user rolls back on unhandled DB error
         mock_db = MagicMock()
         mock_db.execute.return_value.scalar_one_or_none.return_value = None
@@ -409,7 +457,8 @@ class TestDeleteScanEndpoint(unittest.TestCase):
         Base.metadata.drop_all(bind=self.engine)
         self.engine.dispose()
 
-    def test_delete_scan_endpoint_success(self):
+    @patch("app.services.scan_services.analyze_job_content", side_effect=Exception("Gemini offline"))
+    def test_delete_scan_endpoint_success(self, mock_analyze):
         scan = create_scan("Job offer with urgent hiring and no interview required.", self.user.id, self.db)
         res = delete_scan_endpoint(scan_id=scan.id, db=self.db, current_user=self.user)
         self.assertIsInstance(res, Response)
@@ -418,6 +467,234 @@ class TestDeleteScanEndpoint(unittest.TestCase):
     def test_delete_scan_endpoint_not_found(self):
         with self.assertRaises(HTTPException) as ctx:
             delete_scan_endpoint(scan_id=9999, db=self.db, current_user=self.user)
+        self.assertEqual(ctx.exception.status_code, 404)
+
+
+class TestGeminiService(unittest.TestCase):
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_success(self, mock_client):
+        mock_response = MagicMock()
+        mock_response.text = '{"risk_score": 75, "explanation": "Demands advance fee", "indicators": ["registration fee"]}'
+        mock_client.models.generate_content.return_value = mock_response
+
+        result = analyze_job_content("Some job description")
+        self.assertEqual(result["risk_score"], 75)
+        self.assertEqual(result["explanation"], "Demands advance fee")
+        self.assertEqual(result["indicators"], ["registration fee"])
+
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_empty_response(self, mock_client):
+        mock_response = MagicMock()
+        mock_response.text = ""
+        mock_client.models.generate_content.return_value = mock_response
+
+        with self.assertRaises(ValueError) as ctx:
+            analyze_job_content("Job content")
+        self.assertIn("empty response", str(ctx.exception))
+
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_invalid_json(self, mock_client):
+        mock_response = MagicMock()
+        mock_response.text = "NOT JSON"
+        mock_client.models.generate_content.return_value = mock_response
+
+        with self.assertRaises(Exception):
+            analyze_job_content("Job content")
+
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_invalid_risk_score(self, mock_client):
+        for bad_score in [True, False, "80", -1, 101, None]:
+            mock_response = MagicMock()
+            mock_response.text = json.dumps({
+                "risk_score": bad_score,
+                "explanation": "Valid explanation",
+                "indicators": ["Valid indicator"],
+            })
+            mock_client.models.generate_content.return_value = mock_response
+            with self.assertRaises(ValueError):
+                analyze_job_content("Job content")
+
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_invalid_explanation(self, mock_client):
+        for bad_exp in [123, None, ["exp"], {"text": "exp"}]:
+            mock_response = MagicMock()
+            mock_response.text = json.dumps({
+                "risk_score": 50,
+                "explanation": bad_exp,
+                "indicators": ["indicator"],
+            })
+            mock_client.models.generate_content.return_value = mock_response
+            with self.assertRaises(ValueError):
+                analyze_job_content("Job content")
+
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_invalid_indicators(self, mock_client):
+        for bad_ind in ["not a list", [123], None, [{"name": "flag"}]]:
+            mock_response = MagicMock()
+            mock_response.text = json.dumps({
+                "risk_score": 50,
+                "explanation": "Valid explanation",
+                "indicators": bad_ind,
+            })
+            mock_client.models.generate_content.return_value = mock_response
+            with self.assertRaises(ValueError):
+                analyze_job_content("Job content")
+
+
+class TestScanWorkflow(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self.db = self.Session()
+        self.user = create_user(UserCreate(email="workflow@test.com", password="Password123"), self.db)
+
+    def tearDown(self):
+        self.db.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_create_scan_gemini_success_persists_explanation_and_indicators(self, mock_analyze):
+        mock_analyze.return_value = {
+            "risk_score": 70,
+            "explanation": "High probability of recruitment fraud due to unverified employer.",
+            "indicators": ["Suspicious domain", "Direct payment request"],
+        }
+        content = "Job opening with competitive salary and great benefits."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 70)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertEqual(
+            scan.explanation,
+            "High probability of recruitment fraud due to unverified employer.",
+        )
+        self.assertEqual(
+            scan.indicators,
+            ["Suspicious domain", "Direct payment request"],
+        )
+
+        # Retrieval check
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.explanation, scan.explanation)
+        self.assertEqual(fetched.indicators, scan.indicators)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_create_scan_prefers_higher_gemini_score(self, mock_analyze):
+        # Rule score for "urgent hiring" is 10. Gemini score is 80.
+        mock_analyze.return_value = {
+            "risk_score": 80,
+            "explanation": "Multiple scam indicators found in job description.",
+            "indicators": ["Urgent pressure", "Unverified contact"],
+        }
+        content = "We have an urgent hiring need for immediate joiners."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 80)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertEqual(scan.explanation, "Multiple scam indicators found in job description.")
+        self.assertEqual(scan.indicators, ["Urgent pressure", "Unverified contact"])
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_create_scan_prefers_higher_rule_score(self, mock_analyze):
+        # Rule score for "registration fee" is 60. Gemini score is 30.
+        mock_analyze.return_value = {
+            "risk_score": 30,
+            "explanation": "Context has minor concerns but employer looks partially genuine.",
+            "indicators": ["Vague requirements"],
+        }
+        content = "Candidate must pay a registration fee before the start date."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 60)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertEqual(scan.explanation, "Context has minor concerns but employer looks partially genuine.")
+        self.assertEqual(scan.indicators, ["Vague requirements"])
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_create_scan_gemini_failure_falls_back_to_rules(self, mock_analyze):
+        mock_analyze.side_effect = RuntimeError("Gemini API connection error")
+        content = "We have an urgent hiring need and whatsapp only communication."
+        # Rule score: urgent hiring (10) + whatsapp only (15) = 25 -> Medium Risk
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 25)
+        self.assertEqual(scan.verdict, "Medium Risk")
+        self.assertIsNone(scan.explanation)
+        self.assertIsNone(scan.indicators)
+
+        # Ensure scan is still saved and retrievable
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.risk_score, 25)
+        self.assertIsNone(fetched.explanation)
+        self.assertIsNone(fetched.indicators)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_create_scan_gemini_malformed_fields_fallback(self, mock_analyze):
+        malformed_outputs = [
+            {"risk_score": "not_an_int", "explanation": "Bad score", "indicators": []},
+            {"risk_score": True, "explanation": "Bool score", "indicators": []},
+            {"risk_score": -10, "explanation": "Negative score", "indicators": []},
+            {"risk_score": 110, "explanation": "Overflow score", "indicators": []},
+            {"risk_score": 50, "explanation": 12345, "indicators": []},
+            {"risk_score": 50, "explanation": "Valid", "indicators": "not_a_list"},
+            {"risk_score": 50, "explanation": "Valid", "indicators": [1, 2, 3]},
+            "not even a dict",
+        ]
+        content = "Please pay registration fee for onboarding materials."
+        # Rule score: registration fee = 60
+
+        for bad_output in malformed_outputs:
+            mock_analyze.return_value = bad_output
+            scan = create_scan(content, self.user.id, self.db)
+            self.assertEqual(scan.risk_score, 60)
+            self.assertEqual(scan.verdict, "High Risk")
+            self.assertIsNone(scan.explanation)
+            self.assertIsNone(scan.indicators)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_scan_endpoints_response_fields(self, mock_analyze):
+        mock_analyze.return_value = {
+            "risk_score": 85,
+            "explanation": "Definite scam pattern detected with fraudulent recruitment tactics.",
+            "indicators": ["Fake company", "Upfront fee request"],
+        }
+        # 1. POST /scan/
+        req = ScanRequest(content="Job offer with guaranteed job and registration fee required.")
+        create_res = create_scan_endpoint(scan_request=req, db=self.db, current_user=self.user)
+        self.assertEqual(create_res.risk_score, 85)
+        self.assertEqual(create_res.explanation, "Definite scam pattern detected with fraudulent recruitment tactics.")
+        self.assertEqual(create_res.indicators, ["Fake company", "Upfront fee request"])
+
+        # 2. GET /scan/
+        list_res = get_user_scans_endpoint(db=self.db, current_user=self.user)
+        self.assertEqual(len(list_res), 1)
+        self.assertEqual(list_res[0].id, create_res.id)
+        self.assertEqual(list_res[0].explanation, create_res.explanation)
+        self.assertEqual(list_res[0].indicators, create_res.indicators)
+
+        # 3. GET /scan/{scan_id}
+        get_res = get_scan_by_id_endpoint(scan_id=create_res.id, db=self.db, current_user=self.user)
+        self.assertEqual(get_res.id, create_res.id)
+        self.assertEqual(get_res.explanation, create_res.explanation)
+        self.assertEqual(get_res.indicators, create_res.indicators)
+
+    def test_scan_endpoint_idor_protection(self):
+        u2 = create_user(UserCreate(email="user2@test.com", password="Password123"), self.db)
+        with patch("app.services.scan_services.analyze_job_content") as mock_analyze:
+            mock_analyze.return_value = {
+                "risk_score": 40,
+                "explanation": "Mild concerns",
+                "indicators": ["guaranteed job"],
+            }
+            scan = create_scan("We offer a guaranteed job for successful applicants.", self.user.id, self.db)
+
+        # u2 attempts to fetch u1's scan
+        with self.assertRaises(HTTPException) as ctx:
+            get_scan_by_id_endpoint(scan_id=scan.id, db=self.db, current_user=u2)
         self.assertEqual(ctx.exception.status_code, 404)
 
 
