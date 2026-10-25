@@ -1,6 +1,7 @@
 import json
 import unittest
-from unittest.mock import MagicMock, patch
+import httpx
+from unittest.mock import MagicMock, call, patch
 from datetime import datetime, timezone, timedelta
 from jose import jwt
 from pydantic import ValidationError
@@ -1249,6 +1250,156 @@ class TestScanConsistencyAndReconciliation(unittest.TestCase):
         self.assertIsNone(fetched.explanation)
         self.assertIsNone(fetched.indicators)
         self.assertIsNone(fetched.job_details)
+
+
+class TestGeminiTimeout(unittest.TestCase):
+    """Tests for Gemini request timeout configuration and fallback behavior."""
+
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_passes_timeout_in_http_options(self, mock_client):
+        """The configured timeout must be passed inside http_options of GenerateContentConfig."""
+        from google.genai import types as genai_types
+
+        mock_response = MagicMock()
+        mock_response.text = json.dumps({
+            "risk_score": 20,
+            "explanation": "Looks legitimate.",
+            "indicators": [],
+        })
+        mock_client.models.generate_content.return_value = mock_response
+
+        analyze_job_content("A job posting content for timeout test.")
+
+        mock_client.models.generate_content.assert_called_once()
+        call_kwargs = mock_client.models.generate_content.call_args
+
+        config_arg = call_kwargs.kwargs.get("config") or (
+            call_kwargs.args[2] if len(call_kwargs.args) > 2 else None
+        )
+        self.assertIsNotNone(config_arg, "config argument must be present")
+        self.assertIsInstance(config_arg, genai_types.GenerateContentConfig)
+        self.assertIsNotNone(
+            config_arg.http_options,
+            "http_options must be set on GenerateContentConfig",
+        )
+        self.assertEqual(
+            config_arg.http_options.timeout,
+            settings.GEMINI_REQUEST_TIMEOUT_MS,
+            f"timeout must equal GEMINI_REQUEST_TIMEOUT_MS ({settings.GEMINI_REQUEST_TIMEOUT_MS} ms)",
+        )
+
+    @patch("app.services.gemini_service.client")
+    def test_analyze_job_content_timeout_raises_exception(self, mock_client):
+        """httpx.TimeoutException raised by the SDK propagates out of analyze_job_content."""
+        mock_client.models.generate_content.side_effect = httpx.ReadTimeout(
+            "Request timed out"
+        )
+        with self.assertRaises(httpx.TimeoutException):
+            analyze_job_content("Some job posting content.")
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_timeout_triggers_rule_based_fallback_in_create_scan(self, mock_analyze):
+        """When analyze_job_content raises a timeout, create_scan falls back to rule-based scoring."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+        user = create_user(UserCreate(email="timeout@test.com", password="Password123"), db)
+
+        mock_analyze.side_effect = httpx.ReadTimeout("Gemini request timed out")
+        # "registration fee" scores 60 -> High Risk
+        content = "Applicants must pay a registration fee to start the onboarding process."
+        scan = create_scan(content, user.id, db)
+
+        self.assertEqual(scan.risk_score, 60)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertIsNone(scan.explanation)
+        self.assertIsNone(scan.indicators)
+        self.assertIsNone(scan.job_details)
+
+        fetched = get_scan_by_id(scan.id, user.id, db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.risk_score, 60)
+        self.assertEqual(fetched.verdict, "High Risk")
+        self.assertIsNone(fetched.explanation)
+        self.assertIsNone(fetched.indicators)
+
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_timeout_fallback_low_rule_score(self, mock_analyze):
+        """Timeout fallback also works when the rule-based score is low (Low Risk)."""
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+        user = create_user(UserCreate(email="timeout2@test.com", password="Password123"), db)
+
+        mock_analyze.side_effect = httpx.ConnectTimeout("connection timeout")
+        content = "Join our team as a software engineer. Apply via our careers portal."
+        # Rule score: 0
+        scan = create_scan(content, user.id, db)
+
+        self.assertEqual(scan.risk_score, 0)
+        self.assertEqual(scan.verdict, "Low Risk")
+        self.assertIsNone(scan.explanation)
+        self.assertIsNone(scan.indicators)
+        self.assertIsNone(scan.job_details)
+
+        db.close()
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+    def test_invalid_timeout_config_rejected(self):
+        """GEMINI_REQUEST_TIMEOUT_MS must be >= 1; zero and negative values are rejected."""
+        from pydantic import ValidationError as PydanticValidationError
+        from app.core.config import Settings
+
+        with self.assertRaises(PydanticValidationError):
+            Settings(
+                DATABASE_URL="postgresql+psycopg://localhost/test",
+                SECRET_KEY="testsecret",
+                GEMINI_API_KEY="testkey",
+                GEMINI_REQUEST_TIMEOUT_MS=0,
+            )
+
+        with self.assertRaises(PydanticValidationError):
+            Settings(
+                DATABASE_URL="postgresql+psycopg://localhost/test",
+                SECRET_KEY="testsecret",
+                GEMINI_API_KEY="testkey",
+                GEMINI_REQUEST_TIMEOUT_MS=-500,
+            )
+
+    def test_valid_timeout_config_accepted(self):
+        """Valid positive GEMINI_REQUEST_TIMEOUT_MS values must be accepted."""
+        from app.core.config import Settings
+
+        s = Settings(
+            DATABASE_URL="postgresql+psycopg://localhost/test",
+            SECRET_KEY="testsecret",
+            GEMINI_API_KEY="testkey",
+            GEMINI_REQUEST_TIMEOUT_MS=5000,
+        )
+        self.assertEqual(s.GEMINI_REQUEST_TIMEOUT_MS, 5000)
+
+        s2 = Settings(
+            DATABASE_URL="postgresql+psycopg://localhost/test",
+            SECRET_KEY="testsecret",
+            GEMINI_API_KEY="testkey",
+            GEMINI_REQUEST_TIMEOUT_MS=1,
+        )
+        self.assertEqual(s2.GEMINI_REQUEST_TIMEOUT_MS, 1)
+
+    def test_default_timeout_is_reasonable(self):
+        """The default GEMINI_REQUEST_TIMEOUT_MS must be a sensible positive value (>= 5000 ms)."""
+        self.assertGreaterEqual(
+            settings.GEMINI_REQUEST_TIMEOUT_MS,
+            5000,
+            "Default timeout should be at least 5 seconds (5000 ms)",
+        )
 
 
 if __name__ == "__main__":

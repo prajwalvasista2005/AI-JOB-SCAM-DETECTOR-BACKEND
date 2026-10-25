@@ -2,6 +2,7 @@ import json
 from typing import Any
 
 from google import genai
+from google.genai import types
 
 from app.core.config import settings
 
@@ -106,9 +107,12 @@ Job posting:
     response = client.models.generate_content(
         model=settings.GEMINI_MODEL,
         contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-        },
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            http_options=types.HttpOptions(
+                timeout=settings.GEMINI_REQUEST_TIMEOUT_MS,
+            ),
+        ),
     )
 
     if not response.text:
