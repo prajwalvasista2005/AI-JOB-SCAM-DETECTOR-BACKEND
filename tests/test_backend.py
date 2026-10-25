@@ -2162,6 +2162,93 @@ class TestRateLimiting(unittest.TestCase):
         self.assertEqual(success_count, 10, "Exactly 10 requests must be allowed")
         self.assertEqual(blocked_count, 20, "Exactly 20 requests must be blocked with 429")
 
+    # 5. Opportunistic Cleanup & Inactive Key Eviction
+    def test_opportunistic_cleanup_removes_inactive_keys_and_empty_deques(self):
+        """Opportunistic cleanup purges inactive keys and empty deques when triggered."""
+        simulated_time = 100.0
+        custom_limiter = SlidingWindowRateLimiter(
+            time_func=lambda: simulated_time,
+            cleanup_interval=3,
+        )
+
+        # 1st and 2nd checks at t=100.0
+        custom_limiter.check("ip:inactive1", limit=5, window_seconds=60.0)
+        custom_limiter.check("ip:inactive2", limit=5, window_seconds=60.0)
+        # Create an artificial empty deque key
+        _ = custom_limiter._records["ip:empty"]
+
+        self.assertIn("ip:inactive1", custom_limiter._records)
+        self.assertIn("ip:inactive2", custom_limiter._records)
+        self.assertIn("ip:empty", custom_limiter._records)
+        self.assertEqual(custom_limiter._check_count, 2)
+
+        # Advance time by 65s (past the 60s window: cutoff = 165 - 60 = 105.0 > 100.0)
+        simulated_time = 165.0
+
+        # 3rd check reaches cleanup_interval=3 and triggers _cleanup_inactive_keys
+        custom_limiter.check("ip:active3", limit=5, window_seconds=60.0)
+
+        # Inactive keys and empty deques must be evicted
+        self.assertNotIn("ip:inactive1", custom_limiter._records)
+        self.assertNotIn("ip:inactive2", custom_limiter._records)
+        self.assertNotIn("ip:empty", custom_limiter._records)
+
+        # Active key must be present with reset counter
+        self.assertIn("ip:active3", custom_limiter._records)
+        self.assertEqual(custom_limiter._check_count, 0)
+        self.assertEqual(len(custom_limiter._records), 1)
+
+    def test_opportunistic_cleanup_retains_active_keys_and_enforces_limits(self):
+        """Active keys within window are preserved during cleanup and rate limits still apply."""
+        simulated_time = 100.0
+        custom_limiter = SlidingWindowRateLimiter(
+            time_func=lambda: simulated_time,
+            cleanup_interval=2,
+        )
+
+        # Check stale user at t=100
+        custom_limiter.check("user:stale", limit=3, window_seconds=60.0)
+
+        # Check active user at t=140
+        simulated_time = 140.0
+        custom_limiter.check("user:active", limit=3, window_seconds=60.0)
+        self.assertEqual(custom_limiter._check_count, 0)  # Triggered at 2, reset to 0
+
+        # Advance to t=170 (cutoff = 110.0; stale timestamp 100 <= 110, active timestamp 140 > 110)
+        simulated_time = 170.0
+        # 1st check in new cycle
+        custom_limiter.check("user:other", limit=3, window_seconds=60.0)
+        # 2nd check triggers cleanup
+        custom_limiter.check("user:active", limit=3, window_seconds=60.0)
+
+        # Stale user must be evicted, active user preserved with both timestamps
+        self.assertNotIn("user:stale", custom_limiter._records)
+        self.assertIn("user:active", custom_limiter._records)
+        self.assertEqual(len(custom_limiter._records["user:active"]), 2)
+
+        # 3rd request for active user succeeds (limit=3)
+        custom_limiter.check("user:active", limit=3, window_seconds=60.0)
+        self.assertEqual(len(custom_limiter._records["user:active"]), 3)
+
+        # 4th request for active user raises 429
+        with self.assertRaises(HTTPException) as ctx:
+            custom_limiter.check("user:active", limit=3, window_seconds=60.0)
+        self.assertEqual(ctx.exception.status_code, 429)
+
+    def test_limiter_reset_clears_records_and_check_counter(self):
+        """Limiter reset clears both stored records and the cleanup counter."""
+        custom_limiter = SlidingWindowRateLimiter(cleanup_interval=10)
+        custom_limiter.check("key:1", limit=5, window_seconds=60.0)
+        custom_limiter.check("key:2", limit=5, window_seconds=60.0)
+
+        self.assertEqual(len(custom_limiter._records), 2)
+        self.assertEqual(custom_limiter._check_count, 2)
+
+        custom_limiter.reset()
+
+        self.assertEqual(len(custom_limiter._records), 0)
+        self.assertEqual(custom_limiter._check_count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

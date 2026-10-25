@@ -15,17 +15,38 @@ class SlidingWindowRateLimiter:
     """
     Thread-safe in-memory sliding-window rate limiter using time.monotonic.
     Tracks timestamps per key and calculates Retry-After on limit violation.
+    Periodically performs opportunistic cleanup of inactive keys to prevent
+    unbounded memory growth.
     """
 
-    def __init__(self, time_func: Callable[[], float] | None = None):
+    def __init__(
+        self,
+        time_func: Callable[[], float] | None = None,
+        cleanup_interval: int = 1000,
+    ):
         self._lock = threading.Lock()
         self._records: dict[str, deque[float]] = defaultdict(deque)
         self._time_func = time_func
+        self._cleanup_interval = max(1, cleanup_interval)
+        self._check_count = 0
 
     def _get_time(self) -> float:
         if self._time_func is not None:
             return self._time_func()
         return time.monotonic()
+
+    def _cleanup_inactive_keys(self, cutoff: float) -> None:
+        """
+        Removes keys whose timestamp deques are empty or whose latest
+        timestamp has expired beyond the current window threshold.
+        Must be called while holding self._lock.
+        """
+        keys_to_delete = [
+            k for k, timestamps in self._records.items()
+            if not timestamps or timestamps[-1] <= cutoff
+        ]
+        for k in keys_to_delete:
+            self._records.pop(k, None)
 
     def check(self, key: str, limit: int, window_seconds: float) -> None:
         """
@@ -37,6 +58,12 @@ class SlidingWindowRateLimiter:
         cutoff = now - window_seconds
 
         with self._lock:
+            # Opportunistic cleanup to prune inactive keys and bound memory
+            self._check_count += 1
+            if self._check_count >= self._cleanup_interval:
+                self._check_count = 0
+                self._cleanup_inactive_keys(cutoff)
+
             timestamps = self._records[key]
 
             # Evict timestamps outside the sliding window
@@ -61,6 +88,7 @@ class SlidingWindowRateLimiter:
         """Clears all in-memory rate-limit state (useful for test isolation)."""
         with self._lock:
             self._records.clear()
+            self._check_count = 0
 
 
 # Global limiter instance for application routes
