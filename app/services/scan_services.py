@@ -1,5 +1,6 @@
 import logging
 import re
+import unicodedata
 from urllib.parse import urlparse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -9,6 +10,17 @@ from app.schemas.scan import AnalysisMode, InputType
 from app.services.gemini_service import analyze_job_content, parse_extracted_details
 
 logger = logging.getLogger(__name__)
+
+
+class ScanValidationError(ValueError):
+    """Base exception for client-input validation failures in the scan service."""
+    pass
+
+
+class UnsupportedInputModeError(ScanValidationError):
+    """Raised when an unsupported input mode (e.g. standalone URL or image file) is submitted."""
+    pass
+
 
 SCAM_PATTERNS: dict[str, int] = {
     "registration fee": 60,
@@ -22,10 +34,12 @@ SCAM_PATTERNS: dict[str, int] = {
 def detect_input_type(content: str) -> InputType:
     stripped_content = content.strip()
 
-    # Standalone URL check: no unencoded whitespace or newlines, valid http/https scheme and netloc
+    # Standalone URL check: no unencoded whitespace or newlines, valid scheme and netloc
     if not any(c.isspace() for c in stripped_content):
         parsed = urlparse(stripped_content)
-        if parsed.scheme in ("http", "https") and parsed.netloc:
+        if parsed.scheme in ("http", "https", "ftp", "sftp") and parsed.netloc:
+            return InputType.URL
+        if stripped_content.lower().startswith("www.") and "." in stripped_content[4:]:
             return InputType.URL
         elif stripped_content.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp")):
             return InputType.IMAGE
@@ -203,7 +217,27 @@ def reconcile_scan_findings(
 
 
 def create_scan(content: str, user_id: int, db: Session) -> Scan:
+    # Control character validation
+    if any(unicodedata.category(c) == "Cc" and c not in ("\n", "\r", "\t") for c in content):
+        raise ScanValidationError("Content contains invalid control characters")
+
+    # Detect and reject unsupported input modes
     input_type = detect_input_type(content)
+    if input_type == InputType.URL:
+        raise UnsupportedInputModeError(
+            "URL scanning is not currently supported. Direct webpage retrieval is not implemented; please paste the job posting text directly."
+        )
+    if input_type == InputType.IMAGE:
+        raise UnsupportedInputModeError(
+            "Image scanning is not currently supported. Image vision analysis is not implemented; please paste the job posting text directly."
+        )
+
+    # Length and whitespace validation for text content
+    non_ws_count = sum(1 for c in content if not c.isspace()) if content else 0
+    if non_ws_count < 10:
+        raise ScanValidationError("Content must contain at least 10 non-whitespace characters")
+    if len(content) > 50000:
+        raise ScanValidationError("Content exceeds maximum length of 50000 characters")
 
     # Existing rule-based detection
     rule_score = calculate_risk_score(content)

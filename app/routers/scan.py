@@ -5,6 +5,7 @@ from app.core.dependencies import get_current_user, get_db
 from app.models.user import User
 from app.schemas.scan import ScanRequest, ScanResponse
 from app.services.scan_services import (
+    ScanValidationError,
     create_scan,
     delete_scan,
     get_scan_by_id,
@@ -20,7 +21,13 @@ def create_scan_endpoint(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return create_scan(content=scan_request.content, user_id=current_user.id, db=db)
+    try:
+        return create_scan(content=scan_request.content, user_id=current_user.id, db=db)
+    except ScanValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
 
 
 @router.get("/", response_model=list[ScanResponse], status_code=status.HTTP_200_OK)

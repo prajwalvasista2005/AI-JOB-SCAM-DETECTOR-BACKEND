@@ -1,6 +1,7 @@
 from datetime import datetime
 from enum import Enum
 from typing import Any
+import unicodedata
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -30,6 +31,14 @@ class ScanRequest(BaseModel):
             raise ValueError("Content cannot be empty or whitespace only")
         if non_whitespace_count < 10:
             raise ValueError("Content must contain at least 10 non-whitespace characters")
+        return v
+
+    @field_validator("content")
+    @classmethod
+    def validate_control_characters(cls, v: str) -> str:
+        for char in v:
+            if unicodedata.category(char) == "Cc" and char not in ("\n", "\r", "\t"):
+                raise ValueError("Content contains invalid control characters")
         return v
 
 
