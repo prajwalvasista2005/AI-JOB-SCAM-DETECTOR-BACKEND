@@ -19,6 +19,9 @@ class Scan(Base):
     explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
     indicators: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     job_details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    analysis_mode: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="legacy_unknown"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -27,3 +30,8 @@ class Scan(Base):
     )
 
     user = relationship("User", back_populates="scans")
+
+    def __init__(self, **kwargs):
+        if "analysis_mode" not in kwargs or kwargs["analysis_mode"] is None:
+            kwargs["analysis_mode"] = "legacy_unknown"
+        super().__init__(**kwargs)

@@ -16,7 +16,7 @@ from app.core.database import Base
 from app.core.dependencies import get_current_user
 from app.models import User, Scan
 from app.schemas.auth import Token
-from app.schemas.scan import InputType, ScanRequest, ScanResponse, JobDetails
+from app.schemas.scan import AnalysisMode, InputType, ScanRequest, ScanResponse, JobDetails
 from app.schemas.user import UserCreate, UserResponse
 from app.services.gemini_service import (
     EXTRACTION_FIELDS,
@@ -1400,6 +1400,188 @@ class TestGeminiTimeout(unittest.TestCase):
             5000,
             "Default timeout should be at least 5 seconds (5000 ms)",
         )
+
+
+class TestAnalysisModeAndMigration(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self.db = self.Session()
+        self.user = create_user(UserCreate(email="mode_test@test.com", password="Password123"), self.db)
+
+    def tearDown(self):
+        self.db.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    def test_canonical_enum_values(self):
+        self.assertEqual(AnalysisMode.AI_ASSISTED.value, "ai_assisted")
+        self.assertEqual(AnalysisMode.RULES_ONLY.value, "rules_only")
+        self.assertEqual(AnalysisMode.LEGACY_UNKNOWN.value, "legacy_unknown")
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_valid_gemini_result_persists_and_returns_ai_assisted(self, mock_analyze):
+        mock_analyze.return_value = {
+            "risk_score": 10,
+            "explanation": "Standard hiring posting.",
+            "indicators": [],
+            "job_details": {"company_name": "Acme Corp"},
+        }
+        content = "Hiring software engineers at Acme Corp with great benefits."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.analysis_mode, AnalysisMode.AI_ASSISTED.value)
+        self.assertEqual(scan.analysis_mode, "ai_assisted")
+
+        # Database persistence check
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.analysis_mode, "ai_assisted")
+
+        # Schema serialization check
+        response_model = ScanResponse.model_validate(scan)
+        self.assertEqual(response_model.analysis_mode, AnalysisMode.AI_ASSISTED)
+        self.assertEqual(response_model.analysis_mode.value, "ai_assisted")
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_gemini_exception_persists_and_returns_rules_only(self, mock_analyze):
+        mock_analyze.side_effect = RuntimeError("API unavailable")
+        content = "Urgent hiring with guaranteed job and registration fee required."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.analysis_mode, AnalysisMode.RULES_ONLY.value)
+        self.assertEqual(scan.analysis_mode, "rules_only")
+
+        # Database persistence check
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.analysis_mode, "rules_only")
+
+        # Schema serialization check
+        response_model = ScanResponse.model_validate(scan)
+        self.assertEqual(response_model.analysis_mode, AnalysisMode.RULES_ONLY)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_gemini_timeout_persists_and_returns_rules_only(self, mock_analyze):
+        mock_analyze.side_effect = httpx.ReadTimeout("Gemini timed out after deadline")
+        content = "Urgent hiring for data entry role with immediate joining."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.analysis_mode, AnalysisMode.RULES_ONLY.value)
+        self.assertEqual(scan.analysis_mode, "rules_only")
+
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.analysis_mode, "rules_only")
+
+        response_model = ScanResponse.model_validate(scan)
+        self.assertEqual(response_model.analysis_mode, AnalysisMode.RULES_ONLY)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_invalid_gemini_result_fallback_returns_rules_only(self, mock_analyze):
+        invalid_results = [
+            "not a dict",
+            {"risk_score": "not_an_int", "explanation": "Valid", "indicators": []},
+            {"risk_score": 150, "explanation": "Valid", "indicators": []},
+            {"risk_score": 50, "explanation": 12345, "indicators": []},
+            {"risk_score": 50, "explanation": "Valid", "indicators": "not_a_list"},
+            {"risk_score": 50, "explanation": "Valid", "indicators": [123]},
+        ]
+        content = "Please pay registration fee for immediate employment placement."
+
+        for bad in invalid_results:
+            mock_analyze.return_value = bad
+            scan = create_scan(content, self.user.id, self.db)
+            self.assertEqual(scan.analysis_mode, AnalysisMode.RULES_ONLY.value)
+            response_model = ScanResponse.model_validate(scan)
+            self.assertEqual(response_model.analysis_mode, AnalysisMode.RULES_ONLY)
+
+    def test_historical_record_compatibility_via_migration_logic(self):
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+        from sqlalchemy import Column, Integer, MetaData, String, Table, Text, text
+
+        test_engine = create_engine("sqlite:///:memory:")
+        meta = MetaData()
+        # Simulate pre-Fix-3 scans table without analysis_mode column
+        pre_migration_scans = Table(
+            "scans",
+            meta,
+            Column("id", Integer, primary_key=True),
+            Column("user_id", Integer, nullable=False),
+            Column("input_type", String(255), nullable=False),
+            Column("content", Text, nullable=False),
+            Column("risk_score", Integer, nullable=False),
+            Column("verdict", String(255), nullable=False),
+        )
+        meta.create_all(test_engine)
+
+        # Insert historical rows without analysis_mode
+        with test_engine.connect() as conn:
+            conn.execute(
+                pre_migration_scans.insert().values(
+                    id=101,
+                    user_id=1,
+                    input_type="text",
+                    content="Historical job posting from before Fix 3",
+                    risk_score=20,
+                    verdict="Low Risk",
+                )
+            )
+            conn.commit()
+
+            # Execute the migration operations from f3a1b2c4d5e6
+            ctx = MigrationContext.configure(conn)
+            op = Operations(ctx)
+
+            # Step 1: Add nullable column
+            op.add_column("scans", Column("analysis_mode", String(50), nullable=True))
+            # Step 2: Backfill existing rows
+            op.execute(text("UPDATE scans SET analysis_mode = 'legacy_unknown' WHERE analysis_mode IS NULL"))
+            # Step 3: Enforce non-nullability
+            with op.batch_alter_table("scans") as batch_op:
+                batch_op.alter_column("analysis_mode", existing_type=String(50), nullable=False)
+            conn.commit()
+
+            # Verify the backfilled historical record
+            row = conn.execute(text("SELECT id, analysis_mode FROM scans WHERE id = 101")).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[1], "legacy_unknown")
+
+        test_engine.dispose()
+
+    def test_scan_response_serialization_all_modes(self):
+        now = datetime.now(timezone.utc)
+        for mode in [AnalysisMode.AI_ASSISTED, AnalysisMode.RULES_ONLY, AnalysisMode.LEGACY_UNKNOWN]:
+            scan = Scan(
+                id=1,
+                user_id=1,
+                input_type="text",
+                content="Valid content description",
+                risk_score=10,
+                verdict="Low Risk",
+                analysis_mode=mode.value,
+                created_at=now,
+            )
+            resp = ScanResponse.model_validate(scan)
+            self.assertEqual(resp.analysis_mode, mode)
+            json_dict = resp.model_dump()
+            self.assertEqual(json_dict["analysis_mode"], mode.value)
+
+    def test_legacy_record_with_none_mode_normalizes_to_legacy_unknown(self):
+        now = datetime.now(timezone.utc)
+        scan = Scan(
+            id=1,
+            user_id=1,
+            input_type="text",
+            content="Valid content description",
+            risk_score=10,
+            verdict="Low Risk",
+            created_at=now,
+        )
+        resp = ScanResponse.model_validate(scan)
+        self.assertEqual(resp.analysis_mode, AnalysisMode.LEGACY_UNKNOWN)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import Enum
+from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
@@ -7,6 +8,12 @@ class InputType(str, Enum):
     TEXT = "text"
     URL = "url"
     IMAGE = "image"
+
+
+class AnalysisMode(str, Enum):
+    AI_ASSISTED = "ai_assisted"
+    RULES_ONLY = "rules_only"
+    LEGACY_UNKNOWN = "legacy_unknown"
 
 
 class ScanRequest(BaseModel):
@@ -46,9 +53,17 @@ class ScanResponse(BaseModel):
     content: str
     risk_score: int
     verdict: str
+    analysis_mode: AnalysisMode = AnalysisMode.LEGACY_UNKNOWN
     created_at: datetime
     explanation: str | None = None
     indicators: list[str] | None = None
     job_details: JobDetails | None = None
+
+    @field_validator("analysis_mode", mode="before")
+    @classmethod
+    def default_legacy_unknown(cls, v: Any) -> Any:
+        if v is None:
+            return AnalysisMode.LEGACY_UNKNOWN
+        return v
 
     model_config = ConfigDict(from_attributes=True)
