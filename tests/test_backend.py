@@ -31,6 +31,8 @@ from app.services.scan_services import (
     get_user_scans,
     get_scan_by_id,
     delete_scan,
+    find_matched_patterns,
+    reconcile_scan_findings,
 )
 from app.services.user_services import create_user, authenticate_user
 from app.routers.scan import (
@@ -749,8 +751,9 @@ class TestScanWorkflow(unittest.TestCase):
 
         self.assertEqual(scan.risk_score, 60)
         self.assertEqual(scan.verdict, "High Risk")
-        self.assertEqual(scan.explanation, "Context has minor concerns but employer looks partially genuine.")
-        self.assertEqual(scan.indicators, ["Vague requirements"])
+        self.assertIn("registration fee", scan.explanation.lower())
+        self.assertIn("Context has minor concerns but employer looks partially genuine.", scan.explanation)
+        self.assertEqual(scan.indicators, ["registration fee", "Vague requirements"])
 
     @patch("app.services.scan_services.analyze_job_content")
     def test_create_scan_gemini_failure_falls_back_to_rules(self, mock_analyze):
@@ -1065,6 +1068,187 @@ class TestExtractionLogic(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["company_name"], "OpenAI")
         self.assertEqual(parsed["job_title"], "Research Scientist")
+
+
+class TestScanConsistencyAndReconciliation(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self.db = self.Session()
+        self.user = create_user(UserCreate(email="consistency@test.com", password="Password123"), self.db)
+
+    def tearDown(self):
+        self.db.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    def test_find_matched_patterns_accuracy_and_negation(self):
+        self.assertEqual(
+            find_matched_patterns("Candidate must pay a registration fee."),
+            ["registration fee"],
+        )
+        self.assertEqual(
+            find_matched_patterns("We guarantee a guaranteed job and urgent hiring."),
+            ["guaranteed job", "urgent hiring"],
+        )
+        # Negation check: "no registration fee" must not match
+        self.assertEqual(
+            find_matched_patterns("There is no registration fee required."),
+            [],
+        )
+        self.assertEqual(
+            find_matched_patterns("Clean job description with standard terms."),
+            [],
+        )
+
+    def test_reconcile_scan_findings_rule_higher(self):
+        content = "Candidate must pay a registration fee."
+        risk_score, verdict, explanation, indicators = reconcile_scan_findings(
+            content=content,
+            gemini_score=10,
+            gemini_explanation="Looks generally safe.",
+            gemini_indicators=["Informal text"],
+        )
+        self.assertEqual(risk_score, 60)
+        self.assertEqual(verdict, "High Risk")
+        self.assertIn("registration fee", explanation.lower())
+        self.assertIn("warning sign", explanation.lower())
+        self.assertIn("60 (High Risk)", explanation)
+        self.assertIn("10", explanation)
+        self.assertIn("Looks generally safe.", explanation)
+        self.assertEqual(indicators, ["registration fee", "Informal text"])
+
+    def test_reconcile_scan_findings_gemini_higher(self):
+        content = "Urgent hiring for junior engineer."
+        risk_score, verdict, explanation, indicators = reconcile_scan_findings(
+            content=content,
+            gemini_score=70,
+            gemini_explanation="Suspicious job offer asking for personal credentials.",
+            gemini_indicators=["Suspicious credentials request"],
+        )
+        self.assertEqual(risk_score, 70)
+        self.assertEqual(verdict, "High Risk")
+        self.assertEqual(explanation, "Suspicious job offer asking for personal credentials.")
+        self.assertEqual(indicators, ["Suspicious credentials request"])
+
+    def test_reconcile_scan_findings_equal_scores_deduplicates(self):
+        content = "Guaranteed job placement guaranteed."
+        risk_score, verdict, explanation, indicators = reconcile_scan_findings(
+            content=content,
+            gemini_score=25,
+            gemini_explanation="Guaranteed employment claim.",
+            gemini_indicators=["Guaranteed job", "guaranteed job", "Unrealistic promises"],
+        )
+        self.assertEqual(risk_score, 25)
+        self.assertEqual(verdict, "Medium Risk")
+        self.assertEqual(explanation, "Guaranteed employment claim.")
+        self.assertEqual(indicators, ["Guaranteed job", "Unrealistic promises"])
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_case_a_rule_score_higher_than_gemini_score(self, mock_analyze):
+        """Case A: Rule score 60, Gemini score 10 -> score 60, 'High Risk', explanation & indicators acknowledge warning."""
+        mock_analyze.return_value = {
+            "risk_score": 10,
+            "explanation": "The posting appears legitimate and structured normally.",
+            "indicators": [],
+        }
+        content = "Applicants are required to submit an upfront registration fee to participate."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 60)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertIn("registration fee", scan.explanation.lower())
+        self.assertIn("warning sign", scan.explanation.lower())
+        self.assertIn("60 (High Risk)", scan.explanation)
+        self.assertIn("10", scan.explanation)
+        self.assertIn("The posting appears legitimate and structured normally.", scan.explanation)
+        self.assertEqual(scan.indicators, ["registration fee"])
+
+        # Persistence check
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.risk_score, 60)
+        self.assertEqual(fetched.verdict, "High Risk")
+        self.assertEqual(fetched.explanation, scan.explanation)
+        self.assertEqual(fetched.indicators, ["registration fee"])
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_case_b_gemini_score_higher_than_rule_score(self, mock_analyze):
+        """Case B: Gemini score is higher than the rule score -> Gemini's contextual explanation and indicators preserved."""
+        mock_analyze.return_value = {
+            "risk_score": 85,
+            "explanation": "Severe risk of phishing and identity theft via untrusted communication link.",
+            "indicators": ["Phishing link", "Identity theft risk"],
+        }
+        content = "Urgent hiring for quick entry data clerk position."
+        # Rule score for 'urgent hiring' is 10
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 85)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertEqual(
+            scan.explanation,
+            "Severe risk of phishing and identity theft via untrusted communication link.",
+        )
+        self.assertEqual(scan.indicators, ["Phishing link", "Identity theft risk"])
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_case_c_scores_are_equal_no_duplicate_indicators(self, mock_analyze):
+        """Case C: Both scores are equal -> Report remains consistent, no duplicate indicators."""
+        mock_analyze.return_value = {
+            "risk_score": 25,
+            "explanation": "Posting offers an unrealistic guaranteed job outcome.",
+            "indicators": ["guaranteed job", "guaranteed job", "unusual hiring promise"],
+        }
+        content = "We offer a guaranteed job for anyone who signs up today."
+        # Rule score for 'guaranteed job' is 25
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 25)
+        self.assertEqual(scan.verdict, "Medium Risk")
+        self.assertEqual(scan.explanation, "Posting offers an unrealistic guaranteed job outcome.")
+        self.assertEqual(scan.indicators, ["guaranteed job", "unusual hiring promise"])
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_case_d_negated_rule_phrases_not_false_positive_indicators(self, mock_analyze):
+        """Case D: Negated rule phrases do not become false-positive rule indicators."""
+        mock_analyze.return_value = {
+            "risk_score": 5,
+            "explanation": "Standard recruitment notice with explicit disclaimers.",
+            "indicators": [],
+        }
+        content = "Global Technologies Inc. Please note there is no registration fee required to interview."
+        # Rule score must be 0 due to negation
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 5)
+        self.assertEqual(scan.verdict, "Low Risk")
+        self.assertEqual(scan.explanation, "Standard recruitment notice with explicit disclaimers.")
+        self.assertEqual(scan.indicators, [])
+        self.assertNotIn("registration fee", scan.indicators)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_case_e_gemini_exception_fallback_preserved(self, mock_analyze):
+        """Case E: Gemini raises an exception -> Existing rule-based fallback still works with same persistence and response."""
+        mock_analyze.side_effect = RuntimeError("Gemini connection timed out")
+        content = "Candidate must pay a registration fee before the start date."
+        # Rule score: registration fee = 60
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 60)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertIsNone(scan.explanation)
+        self.assertIsNone(scan.indicators)
+        self.assertIsNone(scan.job_details)
+
+        fetched = get_scan_by_id(scan.id, self.user.id, self.db)
+        self.assertIsNotNone(fetched)
+        self.assertEqual(fetched.risk_score, 60)
+        self.assertEqual(fetched.verdict, "High Risk")
+        self.assertIsNone(fetched.explanation)
+        self.assertIsNone(fetched.indicators)
+        self.assertIsNone(fetched.job_details)
 
 
 if __name__ == "__main__":

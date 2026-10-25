@@ -77,12 +77,22 @@ def _is_pattern_present(content_lower: str, pattern: str) -> bool:
     return False
 
 
-def calculate_risk_score(content: str) -> int:
+def find_matched_patterns(content: str) -> list[str]:
+    """
+    Identifies the scam patterns present in the content that are not negated.
+    Returns matched pattern names in the order defined in SCAM_PATTERNS.
+    """
     content_lower = content.lower()
-    score = 0
-    for pattern, pattern_score in SCAM_PATTERNS.items():
-        if _is_pattern_present(content_lower, pattern):
-            score += pattern_score
+    return [
+        pattern
+        for pattern in SCAM_PATTERNS
+        if _is_pattern_present(content_lower, pattern)
+    ]
+
+
+def calculate_risk_score(content: str) -> int:
+    matched = find_matched_patterns(content)
+    score = sum(SCAM_PATTERNS[p] for p in matched)
     return min(score, 100)
 
 
@@ -110,6 +120,86 @@ def get_verdict(risk_score: int) -> str:
     else:
         return "High Risk"
 
+
+def _combine_indicators(
+    rule_patterns: list[str], gemini_indicators: list[str]
+) -> list[str]:
+    """
+    Combines rule pattern indicators with Gemini indicators without duplicates.
+    Preserves case from the first occurrence and maintains insertion order.
+    """
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in list(rule_patterns) + list(gemini_indicators):
+        cleaned = item.strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(cleaned)
+    return result
+
+
+def _build_rule_elevated_explanation(
+    matched_patterns: list[str],
+    rule_score: int,
+    verdict: str,
+    gemini_score: int,
+    gemini_explanation: str,
+) -> str:
+    """
+    Builds an explanation acknowledging rule-based warning signs when the rule
+    score exceeds Gemini's contextual score. Avoids claiming definitive fraud,
+    describes matched patterns cautiously as warning signs, and preserves
+    useful context from Gemini.
+    """
+    patterns_str = ", ".join(f"'{p}'" for p in matched_patterns)
+    warning_phrase = "warning sign" if len(matched_patterns) == 1 else "warning signs"
+    explanation = (
+        f"Rule-based detection identified {warning_phrase} ({patterns_str}), "
+        f"elevating the risk score to {rule_score} ({verdict}) over the contextual score of {gemini_score}. "
+        f"While detected phrases represent warning signs rather than definitive proof of fraud, they warrant caution."
+    )
+    trimmed_gemini = gemini_explanation.strip()
+    if trimmed_gemini:
+        explanation += f" Contextual analysis noted: {trimmed_gemini}"
+    return explanation
+
+
+def reconcile_scan_findings(
+    content: str,
+    gemini_score: int,
+    gemini_explanation: str,
+    gemini_indicators: list[str],
+) -> tuple[int, str, str, list[str]]:
+    """
+    Reconciles rule-based pattern detection with Gemini contextual analysis.
+    Preserves max(rule_score, gemini_score).
+    When rule_score > gemini_score, produces an explanation and indicators that
+    acknowledge the matched rule-based findings without discarding Gemini's context.
+    When gemini_score >= rule_score, preserves Gemini's contextual explanation and indicators.
+    Returns: (risk_score, verdict, explanation, indicators)
+    """
+    matched_patterns = find_matched_patterns(content)
+    rule_score = min(sum(SCAM_PATTERNS[p] for p in matched_patterns), 100)
+    risk_score = max(rule_score, gemini_score)
+    verdict = get_verdict(risk_score)
+
+    if rule_score > gemini_score:
+        explanation = _build_rule_elevated_explanation(
+            matched_patterns=matched_patterns,
+            rule_score=rule_score,
+            verdict=verdict,
+            gemini_score=gemini_score,
+            gemini_explanation=gemini_explanation,
+        )
+        indicators = _combine_indicators(matched_patterns, gemini_indicators)
+    else:
+        explanation = gemini_explanation
+        indicators = _combine_indicators([], gemini_indicators)
+
+    return risk_score, verdict, explanation, indicators
 
 
 def create_scan(content: str, user_id: int, db: Session) -> Scan:
@@ -147,10 +237,12 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         ):
             raise ValueError("Gemini returned invalid indicators")
 
-        # Keep the stronger risk signal; do not add scores together.
-        risk_score = max(rule_score, gemini_score)
-        explanation = gemini_explanation
-        indicators = gemini_indicators
+        risk_score, verdict, explanation, indicators = reconcile_scan_findings(
+            content=content,
+            gemini_score=gemini_score,
+            gemini_explanation=gemini_explanation,
+            gemini_indicators=gemini_indicators,
+        )
         job_details = parse_extracted_details(gemini_result.get("job_details"))
 
     except Exception:
@@ -158,11 +250,10 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
             "Gemini analysis failed; using rule-based scoring"
         )
         risk_score = rule_score
+        verdict = get_verdict(risk_score)
         explanation = None
         indicators = None
         job_details = None
-
-    verdict = get_verdict(risk_score)
 
     new_scan = Scan(
         user_id=user_id,
