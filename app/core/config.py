@@ -1,4 +1,5 @@
 
+from typing import Any
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -14,6 +15,18 @@ class Settings(BaseSettings):
     # Timeout for Gemini API requests in milliseconds. Must be >= 1.
     # Default: 30000 ms (30 seconds).
     GEMINI_REQUEST_TIMEOUT_MS: int = 30000
+
+    # Explicit list of trusted proxy IP addresses. If empty, X-Forwarded-For is ignored.
+    TRUSTED_PROXIES: list[str] = []
+
+    @field_validator("TRUSTED_PROXIES", mode="before")
+    @classmethod
+    def parse_trusted_proxies(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            return [ip.strip() for ip in v.split(",") if ip.strip()]
+        if isinstance(v, (list, tuple, set)):
+            return [str(ip).strip() for ip in v if str(ip).strip()]
+        return []
 
     @field_validator("GEMINI_REQUEST_TIMEOUT_MS")
     @classmethod

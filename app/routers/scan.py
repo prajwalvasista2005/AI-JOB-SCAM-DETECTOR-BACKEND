@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, get_db
+from app.core.rate_limit import scan_rate_limiter
 from app.models.user import User
 from app.schemas.scan import ScanRequest, ScanResponse
 from app.services.scan_services import (
@@ -19,7 +20,7 @@ router = APIRouter(prefix="/scan", tags=["Scan"])
 def create_scan_endpoint(
     scan_request: ScanRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(scan_rate_limiter),
 ):
     try:
         return create_scan(content=scan_request.content, user_id=current_user.id, db=db)

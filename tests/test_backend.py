@@ -7,13 +7,16 @@ from jose import jwt
 from pydantic import ValidationError
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 from fastapi import HTTPException, Response
+from fastapi.testclient import TestClient
 
 from app.core.config import settings
 from app.core.security import DUMMY_HASH, hash_password, normalize_email, verify_password
 from app.core.auth import create_access_token
 from app.core.database import Base
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_db
+from app.core.rate_limit import limiter, SlidingWindowRateLimiter, get_client_ip
 from app.models import User, Scan
 from app.schemas.auth import Token
 from app.schemas.scan import AnalysisMode, InputType, ScanRequest, ScanResponse, JobDetails
@@ -1836,6 +1839,328 @@ class TestInputHardeningAndPromptInjection(unittest.TestCase):
         self.assertEqual(scan.verdict, "High Risk")
         self.assertIn("registration fee", scan.indicators)
         self.assertIn("Rule-based detection identified warning sign ('registration fee')", scan.explanation)
+
+
+class TestRateLimiting(unittest.TestCase):
+    def setUp(self):
+        limiter.reset()
+        self.engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self.db = self.Session()
+
+        # Create two test users
+        self.user1 = create_user(
+            UserCreate(email="user1_rate@example.com", password="Password123!"), self.db
+        )
+        self.user2 = create_user(
+            UserCreate(email="user2_rate@example.com", password="Password123!"), self.db
+        )
+        self.token1 = create_access_token(self.user1.id)
+        self.token2 = create_access_token(self.user2.id)
+
+        # Override get_db dependency in FastAPI app
+        def override_get_db():
+            db = self.Session()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        app.dependency_overrides.clear()
+        limiter.reset()
+        self.db.close()
+        self.engine.dispose()
+
+    # 1. Login rate limit (5 requests per 60s per client IP)
+    def test_login_rate_limiting_boundary_and_retry_after(self):
+        """Allows 5 login attempts per 60 seconds per IP; 6th attempt returns 429 with Retry-After header."""
+        simulated_time = 1000.0
+        with patch("time.monotonic", side_effect=lambda: simulated_time):
+            for i in range(5):
+                res = self.client.post(
+                    "/auth/login",
+                    data={"username": "user1_rate@example.com", "password": "WrongPassword!"},
+                )
+                self.assertEqual(res.status_code, 401, f"Attempt {i+1} should fail auth with 401")
+
+            # 6th attempt from the same client IP exceeds the limit
+            res6 = self.client.post(
+                "/auth/login",
+                data={"username": "user1_rate@example.com", "password": "Password123!"},
+            )
+            self.assertEqual(res6.status_code, 429)
+            self.assertEqual(res6.json()["detail"], "Rate limit exceeded. Please try again later.")
+            self.assertIn("Retry-After", res6.headers)
+            retry_after = int(res6.headers["Retry-After"])
+            self.assertGreaterEqual(retry_after, 1)
+            self.assertLessEqual(retry_after, 60)
+
+    @patch("app.routers.auth.authenticate_user")
+    def test_rate_limited_login_does_not_call_authenticate_user(self, mock_auth):
+        """Rate-limited login requests must not invoke authenticate_user or compute bcrypt hashes."""
+        simulated_time = 1000.0
+        mock_auth.return_value = None
+        with patch("time.monotonic", side_effect=lambda: simulated_time):
+            for _ in range(5):
+                self.client.post(
+                    "/auth/login",
+                    data={"username": "user1_rate@example.com", "password": "WrongPassword!"},
+                )
+            self.assertEqual(mock_auth.call_count, 5)
+
+            # 6th attempt must be rejected before authenticate_user is called
+            res = self.client.post(
+                "/auth/login",
+                data={"username": "user1_rate@example.com", "password": "WrongPassword!"},
+            )
+            self.assertEqual(res.status_code, 429)
+            self.assertEqual(mock_auth.call_count, 5, "authenticate_user must not be called when rate limited")
+
+    def test_login_rate_limiting_independent_ips(self):
+        """Different client IPs have independent login rate limit quotas."""
+        simulated_time = 1000.0
+        with patch("time.monotonic", side_effect=lambda: simulated_time):
+            client_a = TestClient(app, client=("192.168.1.10", 50000))
+            client_b = TestClient(app, client=("192.168.1.20", 50000))
+
+            # Client A exhausts quota (5 attempts)
+            for _ in range(5):
+                res = client_a.post(
+                    "/auth/login",
+                    data={"username": "user1_rate@example.com", "password": "WrongPassword!"},
+                )
+                self.assertEqual(res.status_code, 401)
+
+            res_a = client_a.post(
+                "/auth/login",
+                data={"username": "user1_rate@example.com", "password": "WrongPassword!"},
+            )
+            self.assertEqual(res_a.status_code, 429, "Client A must be rate limited on 6th request")
+
+            # Client B is unaffected and succeeds
+            res_b = client_b.post(
+                "/auth/login",
+                data={"username": "user1_rate@example.com", "password": "Password123!"},
+            )
+            self.assertEqual(res_b.status_code, 200, "Client B must not be affected by Client A's limit")
+
+    def test_login_rate_limiting_window_expiry(self):
+        """After 60 seconds, rate limit window resets and allows new requests."""
+        simulated_time = 1000.0
+
+        def current_time():
+            return simulated_time
+
+        with patch("time.monotonic", side_effect=current_time):
+            for _ in range(5):
+                self.client.post(
+                    "/auth/login",
+                    data={"username": "user1_rate@example.com", "password": "WrongPassword!"},
+                )
+
+            # 6th attempt is blocked
+            res = self.client.post(
+                "/auth/login",
+                data={"username": "user1_rate@example.com", "password": "Password123!"},
+            )
+            self.assertEqual(res.status_code, 429)
+
+            # Advance time by 61 seconds (past the 60-second sliding window)
+            simulated_time += 61.0
+
+            res_after = self.client.post(
+                "/auth/login",
+                data={"username": "user1_rate@example.com", "password": "Password123!"},
+            )
+            self.assertEqual(res_after.status_code, 200, "Request after window expiry must succeed")
+
+    # 2. Scan creation rate limit (10 requests per 60s per user ID)
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_scan_rate_limiting_boundary_and_retry_after(self, mock_analyze):
+        """Allows 10 scan requests per 60s per user; 11th request returns 429 with Retry-After header."""
+        mock_analyze.return_value = {
+            "risk_score": 10,
+            "explanation": "Benign job description.",
+            "indicators": [],
+            "job_details": None,
+        }
+        simulated_time = 2000.0
+        with patch("time.monotonic", side_effect=lambda: simulated_time):
+            headers = {"Authorization": f"Bearer {self.token1}"}
+            payload = {"content": "Hiring a Software Engineer with 3 years of experience at Tech Corp."}
+
+            for i in range(10):
+                res = self.client.post("/scan/", json=payload, headers=headers)
+                self.assertEqual(res.status_code, 201, f"Scan {i+1} should succeed with 201")
+
+            # 11th request for user 1 is blocked
+            res11 = self.client.post("/scan/", json=payload, headers=headers)
+            self.assertEqual(res11.status_code, 429)
+            self.assertEqual(res11.json()["detail"], "Rate limit exceeded. Please try again later.")
+            self.assertIn("Retry-After", res11.headers)
+            self.assertGreaterEqual(int(res11.headers["Retry-After"]), 1)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_rate_limited_scan_does_not_invoke_gemini_or_database(self, mock_analyze):
+        """Rate-limited scan requests do not invoke Gemini or insert rows into the database."""
+        mock_analyze.return_value = {
+            "risk_score": 10,
+            "explanation": "Benign job description.",
+            "indicators": [],
+            "job_details": None,
+        }
+        simulated_time = 2000.0
+        with patch("time.monotonic", side_effect=lambda: simulated_time):
+            headers = {"Authorization": f"Bearer {self.token1}"}
+            payload = {"content": "Hiring a Software Engineer with 3 years of experience at Tech Corp."}
+
+            for _ in range(10):
+                self.client.post("/scan/", json=payload, headers=headers)
+            self.assertEqual(mock_analyze.call_count, 10)
+
+            # 11th request
+            res = self.client.post("/scan/", json=payload, headers=headers)
+            self.assertEqual(res.status_code, 429)
+            self.assertEqual(mock_analyze.call_count, 10, "Gemini must not be called when rate limited")
+
+            # Verify database scan count remains 10
+            scans_count = len(self.db.scalars(select(Scan).where(Scan.user_id == self.user1.id)).all())
+            self.assertEqual(scans_count, 10, "Database must not record rate-limited scan")
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_scan_rate_limiting_independent_users(self, mock_analyze):
+        """Different users have independent scan rate-limit quotas."""
+        mock_analyze.return_value = {
+            "risk_score": 10,
+            "explanation": "Benign job description.",
+            "indicators": [],
+            "job_details": None,
+        }
+        simulated_time = 2000.0
+        with patch("time.monotonic", side_effect=lambda: simulated_time):
+            payload = {"content": "Hiring a Software Engineer with 3 years of experience at Tech Corp."}
+            headers_u1 = {"Authorization": f"Bearer {self.token1}"}
+            headers_u2 = {"Authorization": f"Bearer {self.token2}"}
+
+            # User 1 exhausts 10 requests
+            for _ in range(10):
+                self.client.post("/scan/", json=payload, headers=headers_u1)
+            res_u1 = self.client.post("/scan/", json=payload, headers=headers_u1)
+            self.assertEqual(res_u1.status_code, 429)
+
+            # User 2 can still make scans
+            res_u2 = self.client.post("/scan/", json=payload, headers=headers_u2)
+            self.assertEqual(res_u2.status_code, 201, "User 2 must not be affected by User 1's limit")
+
+    def test_unauthenticated_scan_returns_401_without_consuming_user_quota(self):
+        """Unauthenticated requests fail with 401 and do not consume any user's rate-limit quota."""
+        payload = {"content": "Hiring a Software Engineer with 3 years of experience at Tech Corp."}
+        res = self.client.post("/scan/", json=payload)
+        self.assertEqual(res.status_code, 401)
+
+        # User 1 should still have all 10 quota slots available
+        with patch("app.services.scan_services.analyze_job_content") as mock_analyze:
+            mock_analyze.return_value = {
+                "risk_score": 10,
+                "explanation": "Benign job description.",
+                "indicators": [],
+                "job_details": None,
+            }
+            headers = {"Authorization": f"Bearer {self.token1}"}
+            for _ in range(10):
+                resp = self.client.post("/scan/", json=payload, headers=headers)
+                self.assertEqual(resp.status_code, 201)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_scan_rate_limiting_window_expiry(self, mock_analyze):
+        """Scan quota recovers after the 60-second sliding window passes."""
+        mock_analyze.return_value = {
+            "risk_score": 10,
+            "explanation": "Benign job description.",
+            "indicators": [],
+            "job_details": None,
+        }
+        simulated_time = 2000.0
+
+        def current_time():
+            return simulated_time
+
+        with patch("time.monotonic", side_effect=current_time):
+            headers = {"Authorization": f"Bearer {self.token1}"}
+            payload = {"content": "Hiring a Software Engineer with 3 years of experience at Tech Corp."}
+
+            for _ in range(10):
+                self.client.post("/scan/", json=payload, headers=headers)
+
+            # 11th is blocked
+            self.assertEqual(self.client.post("/scan/", json=payload, headers=headers).status_code, 429)
+
+            # Advance by 61 seconds
+            simulated_time += 61.0
+
+            res_after = self.client.post("/scan/", json=payload, headers=headers)
+            self.assertEqual(res_after.status_code, 201, "Scan request after window expiry must succeed")
+
+    # 3. Security & Anti-Spoofing
+    def test_x_forwarded_for_ignored_by_default(self):
+        """X-Forwarded-For is ignored by default unless client IP matches settings.TRUSTED_PROXIES."""
+        from starlette.requests import Request
+        # By default TRUSTED_PROXIES is empty
+        scope = {
+            "type": "http",
+            "client": ("198.51.100.5", 50000),
+            "headers": [(b"x-forwarded-for", b"203.0.113.195, 10.0.0.1")],
+        }
+        req = Request(scope)
+        self.assertEqual(get_client_ip(req), "198.51.100.5")
+
+    def test_x_forwarded_for_used_only_with_trusted_proxy(self):
+        """When client IP matches TRUSTED_PROXIES, rightmost untrusted IP in X-Forwarded-For is resolved."""
+        from starlette.requests import Request
+        with patch.object(settings, "TRUSTED_PROXIES", ["10.0.0.1", "127.0.0.1"]):
+            # Direct peer is trusted proxy 10.0.0.1
+            scope = {
+                "type": "http",
+                "client": ("10.0.0.1", 50000),
+                "headers": [(b"x-forwarded-for", b"203.0.113.195, 10.0.0.1")],
+            }
+            req = Request(scope)
+            self.assertEqual(get_client_ip(req), "203.0.113.195")
+
+    # 4. Concurrency and Thread Safety
+    def test_limiter_thread_safety_under_concurrent_access(self):
+        """Concurrent requests attempting to exceed quota must atomically enforce limit."""
+        import concurrent.futures
+        custom_limiter = SlidingWindowRateLimiter()
+        limit = 10
+        total_attempts = 30
+
+        def attempt_check():
+            try:
+                custom_limiter.check("concurrent:key", limit=limit, window_seconds=60.0)
+                return True
+            except HTTPException as e:
+                if e.status_code == 429:
+                    return False
+                raise
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(lambda _: attempt_check(), range(total_attempts)))
+
+        success_count = sum(1 for r in results if r is True)
+        blocked_count = sum(1 for r in results if r is False)
+
+        self.assertEqual(success_count, 10, "Exactly 10 requests must be allowed")
+        self.assertEqual(blocked_count, 20, "Exactly 20 requests must be blocked with 429")
 
 
 if __name__ == "__main__":
