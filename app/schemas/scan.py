@@ -17,6 +17,12 @@ class AnalysisMode(str, Enum):
     LEGACY_UNKNOWN = "legacy_unknown"
 
 
+class Verdict(str, Enum):
+    LOW_RISK = "Low Risk"
+    MEDIUM_RISK = "Medium Risk"
+    HIGH_RISK = "High Risk"
+
+
 class ScanRequest(BaseModel):
     content: str = Field(
         min_length=10,

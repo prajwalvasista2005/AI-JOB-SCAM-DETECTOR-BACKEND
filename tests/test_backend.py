@@ -19,7 +19,7 @@ from app.core.dependencies import get_current_user, get_db
 from app.core.rate_limit import limiter, SlidingWindowRateLimiter, get_client_ip
 from app.models import User, Scan
 from app.schemas.auth import Token
-from app.schemas.scan import AnalysisMode, InputType, ScanRequest, ScanResponse, JobDetails
+from app.schemas.scan import AnalysisMode, InputType, ScanRequest, ScanResponse, JobDetails, Verdict
 from app.schemas.user import UserCreate, UserResponse
 from app.services.gemini_service import (
     EXTRACTION_FIELDS,
@@ -2248,6 +2248,310 @@ class TestRateLimiting(unittest.TestCase):
 
         self.assertEqual(len(custom_limiter._records), 0)
         self.assertEqual(custom_limiter._check_count, 0)
+
+
+class TestScanPaginationAndFiltering(unittest.TestCase):
+    """Milestone 2 tests: Scan history pagination, filtering, ordering, and user isolation."""
+
+    def setUp(self):
+        limiter.reset()
+        self.engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=self.engine)
+        self.Session = sessionmaker(bind=self.engine)
+        self.db = self.Session()
+
+        # Create two test users for isolation verification
+        self.user1 = create_user(
+            UserCreate(email="page_user1@example.com", password="Password123!"), self.db
+        )
+        self.user2 = create_user(
+            UserCreate(email="page_user2@example.com", password="Password123!"), self.db
+        )
+        self.token1 = create_access_token(self.user1.id)
+        self.token2 = create_access_token(self.user2.id)
+        self.headers1 = {"Authorization": f"Bearer {self.token1}"}
+        self.headers2 = {"Authorization": f"Bearer {self.token2}"}
+
+        # Override get_db in FastAPI app
+        def override_get_db():
+            db = self.Session()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        app.dependency_overrides.clear()
+        limiter.reset()
+        self.db.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    def _create_scan(
+        self,
+        user_id: int,
+        content: str = "Job vacancy description",
+        risk_score: int = 10,
+        verdict: str = "Low Risk",
+        analysis_mode: str = "ai_assisted",
+        created_at: datetime | None = None,
+    ) -> Scan:
+        scan = Scan(
+            user_id=user_id,
+            input_type="text",
+            content=content,
+            risk_score=risk_score,
+            verdict=verdict,
+            analysis_mode=analysis_mode,
+            created_at=created_at or datetime.now(timezone.utc),
+        )
+        self.db.add(scan)
+        self.db.commit()
+        self.db.refresh(scan)
+        return scan
+
+    def test_default_pagination_returns_up_to_20_newest_first(self):
+        """Default GET /scan/ returns at most 20 scans ordered newest-first."""
+        base_time = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        scans = [
+            self._create_scan(
+                user_id=self.user1.id,
+                content=f"Job posting {i}",
+                created_at=base_time + timedelta(minutes=i),
+            )
+            for i in range(25)
+        ]
+
+        res = self.client.get("/scan/", headers=self.headers1)
+        self.assertEqual(res.status_code, 200)
+        items = res.json()
+        self.assertEqual(len(items), 20)
+
+        # Expected: the last 20 created scans (index 24 down to 5)
+        expected_ids = [s.id for s in reversed(scans[5:])]
+        actual_ids = [item["id"] for item in items]
+        self.assertEqual(actual_ids, expected_ids)
+
+    def test_custom_limit_and_offset(self):
+        """Custom limit and offset correctly slice the newest-first result set."""
+        base_time = datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc)
+        scans = [
+            self._create_scan(
+                user_id=self.user1.id,
+                content=f"Job posting {i}",
+                created_at=base_time + timedelta(minutes=i),
+            )
+            for i in range(15)
+        ]
+        # Full descending order by ID/created_at
+        ordered_ids = [s.id for s in reversed(scans)]
+
+        # Request limit=5, offset=5 (should return items index 5 through 9)
+        res = self.client.get("/scan/?limit=5&offset=5", headers=self.headers1)
+        self.assertEqual(res.status_code, 200)
+        items = res.json()
+        self.assertEqual(len(items), 5)
+        self.assertEqual([item["id"] for item in items], ordered_ids[5:10])
+
+        # Request limit=5, offset=12 (should return remaining 3 items)
+        res2 = self.client.get("/scan/?limit=5&offset=12", headers=self.headers1)
+        self.assertEqual(res2.status_code, 200)
+        items2 = res2.json()
+        self.assertEqual(len(items2), 3)
+        self.assertEqual([item["id"] for item in items2], ordered_ids[12:15])
+
+    def test_empty_history_and_out_of_range_offset(self):
+        """Empty history or offset exceeding count returns an empty list with 200 OK."""
+        # User 2 has no scans
+        res_empty = self.client.get("/scan/", headers=self.headers2)
+        self.assertEqual(res_empty.status_code, 200)
+        self.assertEqual(res_empty.json(), [])
+
+        # User 1 has 3 scans, query with offset=10
+        for i in range(3):
+            self._create_scan(user_id=self.user1.id, content=f"Scan {i}")
+        res_out_of_bounds = self.client.get("/scan/?offset=10", headers=self.headers1)
+        self.assertEqual(res_out_of_bounds.status_code, 200)
+        self.assertEqual(res_out_of_bounds.json(), [])
+
+    def test_invalid_limit_and_offset_return_422(self):
+        """Invalid limit (outside 1-100) or negative offset yields HTTP 422."""
+        invalid_cases = [
+            "/scan/?limit=0",
+            "/scan/?limit=-1",
+            "/scan/?limit=101",
+            "/scan/?limit=abc",
+            "/scan/?offset=-1",
+            "/scan/?offset=xyz",
+        ]
+        for path in invalid_cases:
+            res = self.client.get(path, headers=self.headers1)
+            self.assertEqual(res.status_code, 422, f"Expected 422 for {path}, got {res.status_code}")
+
+    def test_invalid_analysis_mode_and_verdict_return_422(self):
+        """Invalid analysis_mode or verdict query parameter values yield HTTP 422."""
+        res_mode = self.client.get("/scan/?analysis_mode=unsupported_mode", headers=self.headers1)
+        self.assertEqual(res_mode.status_code, 422)
+
+        res_verdict = self.client.get("/scan/?verdict=Extreme%20Risk", headers=self.headers1)
+        self.assertEqual(res_verdict.status_code, 422)
+
+    def test_filtering_by_every_analysis_mode(self):
+        """Filtering by analysis_mode returns only scans matching the specified mode."""
+        self._create_scan(user_id=self.user1.id, analysis_mode="ai_assisted")
+        self._create_scan(user_id=self.user1.id, analysis_mode="rules_only")
+        self._create_scan(user_id=self.user1.id, analysis_mode="legacy_unknown")
+
+        for mode in ("ai_assisted", "rules_only", "legacy_unknown"):
+            res = self.client.get(f"/scan/?analysis_mode={mode}", headers=self.headers1)
+            self.assertEqual(res.status_code, 200)
+            items = res.json()
+            self.assertEqual(len(items), 1, f"Expected 1 item for mode {mode}")
+            self.assertEqual(items[0]["analysis_mode"], mode)
+
+    def test_filtering_by_every_verdict(self):
+        """Filtering by verdict returns only scans matching the specified verdict."""
+        self._create_scan(user_id=self.user1.id, risk_score=10, verdict="Low Risk")
+        self._create_scan(user_id=self.user1.id, risk_score=35, verdict="Medium Risk")
+        self._create_scan(user_id=self.user1.id, risk_score=80, verdict="High Risk")
+
+        # Test "Low Risk"
+        res_low = self.client.get("/scan/?verdict=Low%20Risk", headers=self.headers1)
+        self.assertEqual(res_low.status_code, 200)
+        items_low = res_low.json()
+        self.assertEqual(len(items_low), 1)
+        self.assertEqual(items_low[0]["verdict"], "Low Risk")
+
+        # Test "Medium Risk"
+        res_med = self.client.get("/scan/?verdict=Medium%20Risk", headers=self.headers1)
+        self.assertEqual(res_med.status_code, 200)
+        items_med = res_med.json()
+        self.assertEqual(len(items_med), 1)
+        self.assertEqual(items_med[0]["verdict"], "Medium Risk")
+
+        # Test "High Risk" with plus encoding
+        res_high = self.client.get("/scan/?verdict=High+Risk", headers=self.headers1)
+        self.assertEqual(res_high.status_code, 200)
+        items_high = res_high.json()
+        self.assertEqual(len(items_high), 1)
+        self.assertEqual(items_high[0]["verdict"], "High Risk")
+
+    def test_combined_filters_and_pagination(self):
+        """Combining analysis_mode, verdict, limit, and offset applies all constraints correctly."""
+        # Target scans: rules_only + High Risk (3 total)
+        s1 = self._create_scan(user_id=self.user1.id, analysis_mode="rules_only", verdict="High Risk")
+        s2 = self._create_scan(user_id=self.user1.id, analysis_mode="rules_only", verdict="High Risk")
+        s3 = self._create_scan(user_id=self.user1.id, analysis_mode="rules_only", verdict="High Risk")
+
+        # Distractor scans
+        self._create_scan(user_id=self.user1.id, analysis_mode="ai_assisted", verdict="High Risk")
+        self._create_scan(user_id=self.user1.id, analysis_mode="rules_only", verdict="Low Risk")
+
+        # Page 1: limit 2, offset 0
+        res1 = self.client.get(
+            "/scan/?analysis_mode=rules_only&verdict=High%20Risk&limit=2&offset=0",
+            headers=self.headers1,
+        )
+        self.assertEqual(res1.status_code, 200)
+        items1 = res1.json()
+        self.assertEqual(len(items1), 2)
+        self.assertEqual([item["id"] for item in items1], [s3.id, s2.id])
+        for it in items1:
+            self.assertEqual(it["analysis_mode"], "rules_only")
+            self.assertEqual(it["verdict"], "High Risk")
+
+        # Page 2: limit 2, offset 2
+        res2 = self.client.get(
+            "/scan/?analysis_mode=rules_only&verdict=High%20Risk&limit=2&offset=2",
+            headers=self.headers1,
+        )
+        self.assertEqual(res2.status_code, 200)
+        items2 = res2.json()
+        self.assertEqual(len(items2), 1)
+        self.assertEqual(items2[0]["id"], s1.id)
+
+    def test_deterministic_ordering_for_equal_timestamps(self):
+        """Equal created_at timestamps are deterministically sorted by Scan.id.desc()."""
+        fixed_time = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        s1 = self._create_scan(user_id=self.user1.id, content="First", created_at=fixed_time)
+        s2 = self._create_scan(user_id=self.user1.id, content="Second", created_at=fixed_time)
+        s3 = self._create_scan(user_id=self.user1.id, content="Third", created_at=fixed_time)
+
+        res = self.client.get("/scan/", headers=self.headers1)
+        self.assertEqual(res.status_code, 200)
+        items = res.json()
+
+        # Must be ordered by id descending: s3, s2, s1
+        actual_ids = [item["id"] for item in items]
+        self.assertEqual(actual_ids, [s3.id, s2.id, s1.id])
+
+    def test_user_isolation_across_pagination_and_filters(self):
+        """User isolation is maintained across all pagination and filtering combinations."""
+        # User 1 creates 3 matching scans
+        u1_scans = [
+            self._create_scan(user_id=self.user1.id, analysis_mode="rules_only", verdict="High Risk")
+            for _ in range(3)
+        ]
+        # User 2 creates 3 identical matching scans
+        u2_scans = [
+            self._create_scan(user_id=self.user2.id, analysis_mode="rules_only", verdict="High Risk")
+            for _ in range(3)
+        ]
+
+        # User 1 queries
+        res1 = self.client.get(
+            "/scan/?analysis_mode=rules_only&verdict=High%20Risk&limit=50",
+            headers=self.headers1,
+        )
+        self.assertEqual(res1.status_code, 200)
+        items1 = res1.json()
+        self.assertEqual(len(items1), 3)
+        u1_returned_ids = {item["id"] for item in items1}
+        self.assertEqual(u1_returned_ids, {s.id for s in u1_scans})
+        self.assertFalse(u1_returned_ids.intersection({s.id for s in u2_scans}))
+
+        # User 2 queries
+        res2 = self.client.get(
+            "/scan/?analysis_mode=rules_only&verdict=High%20Risk&limit=50",
+            headers=self.headers2,
+        )
+        self.assertEqual(res2.status_code, 200)
+        items2 = res2.json()
+        self.assertEqual(len(items2), 3)
+        u2_returned_ids = {item["id"] for item in items2}
+        self.assertEqual(u2_returned_ids, {s.id for s in u2_scans})
+        self.assertFalse(u2_returned_ids.intersection({s.id for s in u1_scans}))
+
+    def test_service_get_user_scans_backward_compatibility(self):
+        """get_user_scans service function supports default calls and explicit arguments."""
+        for i in range(5):
+            self._create_scan(user_id=self.user1.id, content=f"Scan {i}", verdict="Low Risk")
+
+        # Default call with only user_id and db
+        all_scans = get_user_scans(self.user1.id, self.db)
+        self.assertEqual(len(all_scans), 5)
+
+        # Custom limit and offset
+        sliced = get_user_scans(self.user1.id, self.db, limit=2, offset=1)
+        self.assertEqual(len(sliced), 2)
+        self.assertEqual(sliced[0].id, all_scans[1].id)
+        self.assertEqual(sliced[1].id, all_scans[2].id)
+
+        # Enum arguments
+        filtered = get_user_scans(
+            self.user1.id,
+            self.db,
+            analysis_mode=AnalysisMode.AI_ASSISTED,
+            verdict=Verdict.LOW_RISK,
+        )
+        self.assertEqual(len(filtered), 5)
 
 
 if __name__ == "__main__":

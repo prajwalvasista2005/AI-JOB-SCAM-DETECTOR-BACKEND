@@ -314,12 +314,38 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         raise
 
 
-def get_user_scans(user_id: int, db: Session) -> list[Scan]:
-    return list(
-        db.scalars(
-            select(Scan).where(Scan.user_id == user_id).order_by(Scan.created_at.desc())
-        ).all()
+def get_user_scans(
+    user_id: int,
+    db: Session,
+    limit: int = 20,
+    offset: int = 0,
+    analysis_mode: str | None = None,
+    verdict: str | None = None,
+) -> list[Scan]:
+    # Extract defaults if FastAPI Query objects are passed during direct function calls
+    actual_limit = limit.default if hasattr(limit, "default") else limit
+    actual_offset = offset.default if hasattr(offset, "default") else offset
+    actual_mode = analysis_mode.default if hasattr(analysis_mode, "default") else analysis_mode
+    actual_verdict = verdict.default if hasattr(verdict, "default") else verdict
+
+    query = select(Scan).where(Scan.user_id == user_id)
+
+    if actual_mode is not None:
+        mode_val = actual_mode.value if hasattr(actual_mode, "value") else str(actual_mode)
+        query = query.where(Scan.analysis_mode == mode_val)
+
+    if actual_verdict is not None:
+        verdict_val = actual_verdict.value if hasattr(actual_verdict, "value") else str(actual_verdict)
+        query = query.where(Scan.verdict == verdict_val)
+
+    query = (
+        query
+        .order_by(Scan.created_at.desc(), Scan.id.desc())
+        .limit(actual_limit)
+        .offset(actual_offset)
     )
+
+    return list(db.scalars(query).all())
 
 
 def get_scan_by_id(scan_id: int, user_id: int, db: Session) -> Scan | None:
