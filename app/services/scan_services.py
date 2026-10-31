@@ -7,7 +7,11 @@ from sqlalchemy.orm import Session
 
 from app.models.scan import Scan
 from app.schemas.scan import AnalysisMode, InputType
-from app.services.gemini_service import analyze_job_content, parse_extracted_details
+from app.services.gemini_service import (
+    EXTRACTION_FIELDS,
+    analyze_job_content,
+    parse_extracted_details,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -221,26 +225,37 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
     if any(unicodedata.category(c) == "Cc" and c not in ("\n", "\r", "\t") for c in content):
         raise ScanValidationError("Content contains invalid control characters")
 
-    # Detect and reject unsupported input modes
+    # Detect and handle input modes
     input_type = detect_input_type(content)
-    if input_type == InputType.URL:
-        raise UnsupportedInputModeError(
-            "URL scanning is not currently supported. Direct webpage retrieval is not implemented; please paste the job posting text directly."
-        )
     if input_type == InputType.IMAGE:
         raise UnsupportedInputModeError(
             "Image scanning is not currently supported. Image vision analysis is not implemented; please paste the job posting text directly."
         )
 
-    # Length and whitespace validation for text content
-    non_ws_count = sum(1 for c in content if not c.isspace()) if content else 0
+    if input_type == InputType.URL:
+        from app.services.url_fetch_service import fetch_job_url
+
+        original_url = content.strip()
+        scannable_text, final_url = fetch_job_url(original_url)
+        # Sanitize fetched text: strip null bytes and inappropriate control characters
+        scannable_text = "".join(
+            c for c in scannable_text
+            if not (unicodedata.category(c) == "Cc" and c not in ("\n", "\r", "\t"))
+        )
+    else:
+        original_url = None
+        final_url = None
+        scannable_text = content
+
+    # Length and whitespace validation for scannable text content
+    non_ws_count = sum(1 for c in scannable_text if not c.isspace()) if scannable_text else 0
     if non_ws_count < 10:
         raise ScanValidationError("Content must contain at least 10 non-whitespace characters")
-    if len(content) > 50000:
+    if len(scannable_text) > 50000:
         raise ScanValidationError("Content exceeds maximum length of 50000 characters")
 
     # Existing rule-based detection
-    rule_score = calculate_risk_score(content)
+    rule_score = calculate_risk_score(scannable_text)
 
     explanation: str | None = None
     indicators: list[str] | None = None
@@ -249,7 +264,7 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
 
     # Gemini provides contextual analysis
     try:
-        gemini_result = analyze_job_content(content)
+        gemini_result = analyze_job_content(scannable_text)
         if not isinstance(gemini_result, dict):
             raise ValueError("Gemini analysis returned unexpected format")
 
@@ -273,7 +288,7 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
             raise ValueError("Gemini returned invalid indicators")
 
         risk_score, verdict, explanation, indicators = reconcile_scan_findings(
-            content=content,
+            content=scannable_text,
             gemini_score=gemini_score,
             gemini_explanation=gemini_explanation,
             gemini_indicators=gemini_indicators,
@@ -292,10 +307,18 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         job_details = None
         analysis_mode = AnalysisMode.RULES_ONLY.value
 
+    if input_type == InputType.URL:
+        if job_details is None:
+            job_details = {field: None for field in EXTRACTION_FIELDS}
+        # M-1: Always record the exact original URL submitted by the user
+        job_details["scanned_url"] = original_url
+        if not job_details.get("application_url"):
+            job_details["application_url"] = final_url or original_url
+
     new_scan = Scan(
         user_id=user_id,
         input_type=input_type.value,
-        content=content,
+        content=scannable_text,
         risk_score=risk_score,
         verdict=verdict,
         analysis_mode=analysis_mode,

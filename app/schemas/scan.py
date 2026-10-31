@@ -58,6 +58,7 @@ class JobDetails(BaseModel):
     education_required: str | None = None
     application_method: str | None = None
     application_url: str | None = None
+    scanned_url: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

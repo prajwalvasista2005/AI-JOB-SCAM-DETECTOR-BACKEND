@@ -19,6 +19,15 @@ class Settings(BaseSettings):
     # Explicit list of trusted proxy IP addresses. If empty, X-Forwarded-For is ignored.
     TRUSTED_PROXIES: list[str] = []
 
+    # URL Ingestion Settings
+    URL_FETCH_TIMEOUT_SECONDS: float = 10.0
+    URL_FETCH_CONNECT_TIMEOUT_SECONDS: float = 3.0
+    URL_FETCH_READ_TIMEOUT_SECONDS: float = 5.0
+    URL_FETCH_MAX_BYTES: int = 2 * 1024 * 1024  # 2 MiB
+    URL_FETCH_MAX_REDIRECTS: int = 3
+    URL_FETCH_MAX_TEXT_LENGTH: int = 50000
+    URL_FETCH_MIN_TEXT_LENGTH: int = 10
+
     @field_validator("TRUSTED_PROXIES", mode="before")
     @classmethod
     def parse_trusted_proxies(cls, v: Any) -> list[str]:
