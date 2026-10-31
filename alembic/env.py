@@ -10,10 +10,14 @@ from app.models.user import User
 from app.models.scan import Scan
 
 config = context.config
-config.set_main_option(
-    "sqlalchemy.url",
-    settings.DATABASE_URL.replace("%", "%%")
-)
+custom_url = context.get_x_argument(as_dictionary=True).get("url")
+if custom_url:
+    config.set_main_option("sqlalchemy.url", custom_url.replace("%", "%%"))
+else:
+    config.set_main_option(
+        "sqlalchemy.url",
+        settings.DATABASE_URL.replace("%", "%%")
+    )
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

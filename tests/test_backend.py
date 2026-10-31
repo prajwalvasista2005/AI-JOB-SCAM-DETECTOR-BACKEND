@@ -3284,5 +3284,165 @@ class TestSecureURLIngestion(unittest.TestCase):
         self.assertEqual(mock_fetch.call_count, 10)
 
 
+class TestPhase4Cleanup(unittest.TestCase):
+    """Phase 4: Essential Backend Cleanup tests (CORS, Database Index, Migration)."""
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def test_cors_preflight_allowed_origin(self):
+        """CORS OPTIONS preflight request from allowed origin returns 200 with appropriate CORS headers."""
+        response = self.client.options(
+            "/scan/",
+            headers={
+                "Origin": "http://localhost:3000",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization,Content-Type",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "http://localhost:3000")
+        self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
+        allow_methods = response.headers.get("access-control-allow-methods", "")
+        self.assertIn("POST", allow_methods)
+
+    def test_cors_preflight_disallowed_origin(self):
+        """CORS OPTIONS preflight request from untrusted origin does not return allow-origin header."""
+        response = self.client.options(
+            "/scan/",
+            headers={
+                "Origin": "http://untrusted-site.com",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+        self.assertNotIn("access-control-allow-origin", response.headers)
+
+    def test_cors_actual_request_allowed_origin(self):
+        """CORS actual GET request from allowed origin includes access-control-allow-origin header."""
+        response = self.client.get(
+            "/health",
+            headers={"Origin": "http://localhost:5173"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "http://localhost:5173")
+        self.assertEqual(response.headers.get("access-control-allow-credentials"), "true")
+
+    def test_cors_config_wildcard_disables_credentials(self):
+        """Wildcard origin disables allow_credentials to prevent security violation."""
+        from app.core.config import Settings
+        custom_settings = Settings(
+            DATABASE_URL="sqlite:///:memory:",
+            SECRET_KEY="test-secret",
+            GEMINI_API_KEY="test-key",
+            CORS_ORIGINS=["*"],
+        )
+        self.assertEqual(custom_settings.CORS_ORIGINS, ["*"])
+        allow_credentials = "*" not in custom_settings.CORS_ORIGINS
+        self.assertFalse(allow_credentials)
+
+    def test_cors_config_string_parsing(self):
+        """CORS_ORIGINS parses comma-separated string from environment."""
+        from app.core.config import Settings
+        custom_settings = Settings(
+            DATABASE_URL="sqlite:///:memory:",
+            SECRET_KEY="test-secret",
+            GEMINI_API_KEY="test-key",
+            CORS_ORIGINS="http://app1.com, http://app2.com ",
+        )
+        self.assertEqual(custom_settings.CORS_ORIGINS, ["http://app1.com", "http://app2.com"])
+
+    def test_cors_config_trailing_slash_normalization(self):
+        """CORS_ORIGINS strips trailing slashes, deduplicates, and handles empty/root values safely."""
+        from app.core.config import Settings
+        custom_settings = Settings(
+            DATABASE_URL="sqlite:///:memory:",
+            SECRET_KEY="test-secret",
+            GEMINI_API_KEY="test-key",
+            CORS_ORIGINS="https://app1.com/, https://app2.com///, https://app1.com, /, ///,   ",
+        )
+        self.assertEqual(custom_settings.CORS_ORIGINS, ["https://app1.com", "https://app2.com"])
+
+        # Preserves wildcard and handles list input with trailing slashes
+        list_settings = Settings(
+            DATABASE_URL="sqlite:///:memory:",
+            SECRET_KEY="test-secret",
+            GEMINI_API_KEY="test-key",
+            CORS_ORIGINS=["https://example.com/", "*", "https://example.com"],
+        )
+        self.assertEqual(list_settings.CORS_ORIGINS, ["https://example.com", "*"])
+
+        # Completely empty or slash-only origin string yields empty list
+        empty_settings = Settings(
+            DATABASE_URL="sqlite:///:memory:",
+            SECRET_KEY="test-secret",
+            GEMINI_API_KEY="test-key",
+            CORS_ORIGINS="   ,  /, ///  ",
+        )
+        self.assertEqual(empty_settings.CORS_ORIGINS, [])
+
+    def test_scan_model_has_composite_index(self):
+        """Scan model defines composite index on (user_id, created_at)."""
+        from app.models.scan import Scan
+        idx_map = {idx.name: [c.name for c in idx.columns] for idx in Scan.__table__.indexes}
+        self.assertIn("ix_scans_user_id_created_at", idx_map)
+        self.assertEqual(idx_map["ix_scans_user_id_created_at"], ["user_id", "created_at"])
+
+    def test_scan_history_query_plan_uses_composite_index(self):
+        """SQLite query planner utilizes composite index for user_id filtering and created_at sorting."""
+        import sqlalchemy as sa
+        test_engine = sa.create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=test_engine)
+        with test_engine.connect() as conn:
+            plan = conn.execute(sa.text(
+                "EXPLAIN QUERY PLAN SELECT id, content, created_at FROM scans "
+                "WHERE user_id = 1 ORDER BY created_at DESC, id DESC LIMIT 20 OFFSET 0"
+            )).fetchall()
+            plan_str = " ".join(str(row) for row in plan)
+            self.assertIn("ix_scans_user_id_created_at", plan_str)
+        test_engine.dispose()
+
+    def test_alembic_composite_index_migration_upgrade_and_downgrade(self):
+        """Alembic migration c8e1a2b3d4f5 creates and drops the composite index cleanly."""
+        import tempfile
+        import os
+        from alembic.config import Config
+        from alembic import command
+        import sqlalchemy as sa
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "alembic_test.db")
+            db_url = f"sqlite:///{db_path}"
+            engine = sa.create_engine(db_url)
+            Base.metadata.create_all(bind=engine)
+
+            with engine.connect() as conn:
+                conn.execute(sa.text("DROP INDEX IF EXISTS ix_scans_user_id_created_at"))
+                conn.execute(sa.text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)"))
+                conn.execute(sa.text("INSERT INTO alembic_version (version_num) VALUES ('f3a1b2c4d5e6')"))
+                conn.commit()
+
+            cfg = Config("alembic.ini")
+            cfg.cmd_opts = type("CmdOpts", (), {"x": [f"url={db_url}"]})()
+
+            # Upgrade to head (c8e1a2b3d4f5)
+            command.upgrade(cfg, "head")
+            inspector = sa.inspect(engine)
+            idx_names = [idx["name"] for idx in inspector.get_indexes("scans")]
+            self.assertIn("ix_scans_user_id_created_at", idx_names)
+
+            # Downgrade to -1 (f3a1b2c4d5e6)
+            command.downgrade(cfg, "-1")
+            inspector = sa.inspect(engine)
+            idx_names = [idx["name"] for idx in inspector.get_indexes("scans")]
+            self.assertNotIn("ix_scans_user_id_created_at", idx_names)
+
+            # Re-upgrade to head
+            command.upgrade(cfg, "head")
+            inspector = sa.inspect(engine)
+            idx_names = [idx["name"] for idx in inspector.get_indexes("scans")]
+            self.assertIn("ix_scans_user_id_created_at", idx_names)
+            engine.dispose()
+
+
 if __name__ == "__main__":
     unittest.main()

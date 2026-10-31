@@ -19,6 +19,14 @@ class Settings(BaseSettings):
     # Explicit list of trusted proxy IP addresses. If empty, X-Forwarded-For is ignored.
     TRUSTED_PROXIES: list[str] = []
 
+    # Configurable allowed origins for CORS
+    CORS_ORIGINS: list[str] = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+    ]
+
     # URL Ingestion Settings
     URL_FETCH_TIMEOUT_SECONDS: float = 10.0
     URL_FETCH_CONNECT_TIMEOUT_SECONDS: float = 3.0
@@ -36,6 +44,24 @@ class Settings(BaseSettings):
         if isinstance(v, (list, tuple, set)):
             return [str(ip).strip() for ip in v if str(ip).strip()]
         return []
+
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v: Any) -> list[str]:
+        raw_items: list[Any]
+        if isinstance(v, str):
+            raw_items = v.split(",")
+        elif isinstance(v, (list, tuple, set)):
+            raw_items = list(v)
+        else:
+            return []
+
+        cleaned: list[str] = []
+        for item in raw_items:
+            s = str(item).strip().rstrip("/")
+            if s and s not in cleaned:
+                cleaned.append(s)
+        return cleaned
 
     @field_validator("GEMINI_REQUEST_TIMEOUT_MS")
     @classmethod
