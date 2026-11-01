@@ -3444,5 +3444,1591 @@ class TestPhase4Cleanup(unittest.TestCase):
             engine.dispose()
 
 
+class TestStage1CoreDetection(unittest.TestCase):
+    """
+    Stage 1 tests for Phase 5 Advanced Scam Detection Engine:
+      - Scoring order-invariance across permutations
+      - Multiple tied anchor categories
+      - Exact quotation matching and grounding
+      - Bidirectional negation handling (preceding and succeeding)
+      - Unknown provenance and enum fallback sanitization
+    """
+
+    def test_scoring_order_invariance_across_permutations(self):
+        """Scoring produces identical results for all permutations of evidence items."""
+        import itertools
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            calculate_evidence_score,
+        )
+
+        f_fee = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,  # Base Anchor = 65
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Upfront fee required",
+        )
+        f_task = EvidenceItem(
+            id="TASK_SCAM",
+            category=ScamCategory.TASK_OPTIMIZATION,
+            source=DetectionSource.RULE_AND_AI,
+            severity=FindingSeverity.HIGH,  # Residual = +10
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Daily task quotas",
+        )
+        f_comm = EvidenceItem(
+            id="COMM_HANDLE",
+            category=ScamCategory.SUSPICIOUS_COMMUNICATION,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.MEDIUM,  # Residual = +5
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Telegram handle",
+        )
+        f_salary = EvidenceItem(
+            id="SALARY_LURE",
+            category=ScamCategory.SALARY_MANIPULATION,
+            source=DetectionSource.AI_INFERENCE,
+            severity=FindingSeverity.LOW,  # Residual = +0
+            status=FindingStatus.CONTEXTUAL_INFERENCE,
+            explanation="Mild salary talk",
+        )
+
+        items = [f_fee, f_task, f_comm, f_salary]
+        # Base 65 + 10 (task) + 5 (comm) + 0 (salary) = 80
+        for perm in itertools.permutations(items):
+            score = calculate_evidence_score(list(perm))
+            self.assertEqual(score, 80, f"Order-dependence detected on permutation: {perm}")
+
+    def test_scoring_multiple_critical_tied_anchors(self):
+        """When multiple categories have findings tied at CRITICAL, all are anchors and none compound."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            calculate_evidence_score,
+        )
+
+        f_fee = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Fee",
+        )
+        f_overpay = EvidenceItem(
+            id="OVERPAY",
+            category=ScamCategory.EQUIPMENT_OVERPAYMENT,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Check",
+        )
+
+        # Both are anchor categories (CRITICAL=65). Residual is 0.
+        self.assertEqual(calculate_evidence_score([f_fee, f_overpay]), 65)
+        self.assertEqual(calculate_evidence_score([f_overpay, f_fee]), 65)
+
+        # Adding a HIGH in a remaining category compounds by +10
+        f_task = EvidenceItem(
+            id="TASK_SCAM",
+            category=ScamCategory.TASK_OPTIMIZATION,
+            source=DetectionSource.RULE_AND_AI,
+            severity=FindingSeverity.HIGH,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Task",
+        )
+        self.assertEqual(calculate_evidence_score([f_fee, f_overpay, f_task]), 75)
+        self.assertEqual(calculate_evidence_score([f_task, f_fee, f_overpay]), 75)
+        self.assertEqual(calculate_evidence_score([f_overpay, f_task, f_fee]), 75)
+
+    def test_scoring_multiple_high_tied_anchors(self):
+        """When multiple categories tie at HIGH, all are anchors (Base=45), remaining compound."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            calculate_evidence_score,
+        )
+
+        f_task = EvidenceItem(
+            id="TASK_SCAM",
+            category=ScamCategory.TASK_OPTIMIZATION,
+            source=DetectionSource.RULE_AND_AI,
+            severity=FindingSeverity.HIGH,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Task",
+        )
+        f_fake = EvidenceItem(
+            id="FAKE_RECRUIT",
+            category=ScamCategory.FAKE_RECRUITMENT,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.HIGH,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Guaranteed job",
+        )
+        f_comm = EvidenceItem(
+            id="COMM_HANDLE",
+            category=ScamCategory.SUSPICIOUS_COMMUNICATION,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.MEDIUM,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Telegram handle",
+        )
+
+        # Anchor categories = {TASK_OPTIMIZATION, FAKE_RECRUITMENT} (Base=45).
+        # Remaining category = {SUSPICIOUS_COMMUNICATION} (MEDIUM = +5).
+        # Total = 45 + 5 = 50.
+        self.assertEqual(calculate_evidence_score([f_task, f_fake, f_comm]), 50)
+        self.assertEqual(calculate_evidence_score([f_comm, f_task, f_fake]), 50)
+        self.assertEqual(calculate_evidence_score([f_fake, f_comm, f_task]), 50)
+
+    def test_quotation_validation_exact_match(self):
+        """Verbatim matching quote preserves EXPLICIT_CLAIM status and severity."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+        )
+
+        content = "We have an opening. Please pay a registration fee of Rs. 500 to proceed."
+        finding = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.AI_INFERENCE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="registration fee of Rs. 500",
+            explanation="Upfront fee demanded",
+        )
+        validated = validate_evidence_quotation(finding, content)
+        self.assertEqual(validated.status, FindingStatus.EXPLICIT_CLAIM)
+        self.assertEqual(validated.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(validated.matched_text, "registration fee of Rs. 500")
+
+    def test_quotation_validation_fabricated_quote_capped(self):
+        """Fabricated AI quote is downgraded to CONTEXTUAL_INFERENCE, matched_text cleared, severity capped at HIGH."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+        )
+
+        content = "Standard software engineering position at Tech Corp. Apply online."
+        finding = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.AI_INFERENCE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="pay $1000 fee via wire transfer immediately",  # Fabricated
+            explanation="Hallucinated fee",
+        )
+        validated = validate_evidence_quotation(finding, content)
+        self.assertEqual(validated.status, FindingStatus.CONTEXTUAL_INFERENCE)
+        self.assertIsNone(validated.matched_text)
+        self.assertEqual(validated.severity, FindingSeverity.HIGH)  # Capped from CRITICAL
+
+    def test_quotation_validation_preceding_negation(self):
+        """Preceding negation (e.g. 'no fee', 'never ask for fee') suppresses finding to INFORMATIONAL."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+        )
+
+        content = "ACME Corp hiring. Note: There is no registration fee required for testing."
+        finding = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="registration fee",
+            explanation="Fee check",
+        )
+        validated = validate_evidence_quotation(finding, content)
+        self.assertEqual(validated.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(validated.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+    def test_quotation_validation_succeeding_negation(self):
+        """Succeeding negation (e.g. 'registration fee is not required', 'fee is waived') suppresses finding."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+        )
+
+        # Case A: "is not required"
+        content_a = "Welcome to our careers page. Registration fee is not required."
+        finding_a = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="Registration fee",
+            explanation="Fee check",
+        )
+        validated_a = validate_evidence_quotation(finding_a, content_a)
+        self.assertEqual(validated_a.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(validated_a.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # Case B: "is waived"
+        content_b = "For this drive, application fee is waived for all candidates."
+        finding_b = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="application fee",
+            explanation="Fee check",
+        )
+        validated_b = validate_evidence_quotation(finding_b, content_b)
+        self.assertEqual(validated_b.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(validated_b.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+    def test_quotation_validation_non_refundable_not_falsely_negated(self):
+        """Phrases with 'non-refundable' assert mandatory payment and must NOT be negated."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+        )
+
+        content = "Candidates must deposit a non-refundable registration fee of Rs. 1,000."
+        finding = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="registration fee",
+            explanation="Fee check",
+        )
+        validated = validate_evidence_quotation(finding, content)
+        # Must retain CRITICAL and EXPLICIT_CLAIM
+        self.assertEqual(validated.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(validated.status, FindingStatus.EXPLICIT_CLAIM)
+
+    def test_evidence_item_unknown_provenance_and_enum_sanitization(self):
+        """EvidenceItem safely maps unknown source/category/severity/status and ignores extra fields."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+        )
+
+        raw = {
+            "id": "CUSTOM_1",
+            "category": "experimental_crypto_heist",  # Unknown category
+            "source": "TELEPATHIC_INFERENCE",         # Unknown source
+            "severity": "APOCALYPTIC",                # Unknown severity
+            "status": "ABSOLUTELY_TRUE",              # Unknown status
+            "explanation": "Test explanation",
+            "unexpected_legacy_field": "test_value",  # Extra field
+        }
+
+        item = EvidenceItem.model_validate(raw)
+        self.assertEqual(item.id, "CUSTOM_1")
+        self.assertEqual(item.category, ScamCategory.UNKNOWN)
+        self.assertEqual(item.source, DetectionSource.UNKNOWN)  # Mapped to UNKNOWN per requirement
+        self.assertEqual(item.severity, FindingSeverity.LOW)
+        self.assertEqual(item.status, FindingStatus.AMBIGUOUS_SIGNAL)
+        self.assertFalse(hasattr(item, "unexpected_legacy_field"))
+
+    def test_adv_fee_payment_rail_requires_payment_demand_context(self):
+        """ADV_FEE_PAYMENT_RAIL_DIRECT requires payment verb and ignores benign HR contact addresses."""
+        from app.services.detection import DETECTION_PATTERNS
+
+        pattern = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_PAYMENT_RAIL_DIRECT")
+
+        # Positive scam demands:
+        self.assertIsNotNone(pattern.regex.search("Please pay registration fee of Rs. 500 via upi id hr.desk@okhdfcbank to confirm."))
+        self.assertIsNotNone(pattern.regex.search("Send Rs. 1,000 to recruiter@okaxis before receiving appointment."))
+        self.assertIsNotNone(pattern.regex.search("Transfer onboarding deposit through CashApp or Zelle."))
+        self.assertIsNotNone(pattern.regex.search("Deposit funds via crypto or QR code."))
+        self.assertIsNotNone(pattern.regex.search("Pay fee into hr@paytm."))
+
+        # Negative benign mentions (HR email, contact handle, lunch allowance):
+        self.assertIsNone(pattern.regex.search("For job inquiries, contact our campus recruiter at careers@paytm."))
+        self.assertIsNone(pattern.regex.search("Direct resumes to hr.support@okhdfcbank or talent@okaxis."))
+        self.assertIsNone(pattern.regex.search("Our office is located near the SBI regional hub (email: contact@oksbi)."))
+        self.assertIsNone(pattern.regex.search("Employees receive monthly food allowances via UPI or Sodexo coupons."))
+
+    def test_fake_recruitment_qualified_no_interview(self):
+        """FAKE_RECRUIT_GUARANTEED_JOB detects genuine unvetted hiring but excludes fee disclaimers."""
+        from app.services.detection import DETECTION_PATTERNS
+
+        pattern = next(p for p in DETECTION_PATTERNS if p.pattern_id == "FAKE_RECRUIT_GUARANTEED_JOB")
+
+        # Positive scam guarantees:
+        self.assertIsNotNone(pattern.regex.search("Immediate joining! Direct appointment letter without interview or screening."))
+        self.assertIsNotNone(pattern.regex.search("100% guaranteed job placement upon payment."))
+        self.assertIsNotNone(pattern.regex.search("Direct selection with no interview required."))
+        self.assertIsNotNone(pattern.regex.search("Walk-in offer letter issued with no interview scheduled."))
+
+        # Negative benign disclaimers:
+        self.assertIsNone(pattern.regex.search("Notice to all applicants: There is no interview fee for this recruitment drive."))
+        self.assertIsNone(pattern.regex.search("No interview questions will be shared beforehand by the hiring panel."))
+        self.assertIsNone(pattern.regex.search("Candidates who attend the interview will receive transport reimbursement."))
+
+    def test_cred_harvest_auth_secrets_distinguishes_technical_descriptions(self):
+        """CRED_HARVEST_AUTH_SECRETS catches credential theft but excludes technical engineering JDs."""
+        from app.services.detection import DETECTION_PATTERNS
+
+        pattern = next(p for p in DETECTION_PATTERNS if p.pattern_id == "CRED_HARVEST_AUTH_SECRETS")
+
+        # Positive credential harvesting attempts:
+        self.assertIsNotNone(pattern.regex.search("Please share your UPI PIN to claim the salary disbursement."))
+        self.assertIsNotNone(pattern.regex.search("Enter your bank OTP sent to your phone to complete verification."))
+        self.assertIsNotNone(pattern.regex.search("Your debit card pin is required before equipment dispatch."))
+        self.assertIsNotNone(pattern.regex.search("Share the OTP received on your mobile to verify your bank account."))
+
+        # Negative technical engineering job descriptions:
+        self.assertIsNone(pattern.regex.search("Senior Backend Engineer: Must have experience building Twilio SMS OTP delivery systems."))
+        self.assertIsNone(pattern.regex.search("Fintech QA Lead: Testing bank OTP verification flows and payment gateway APIs."))
+        self.assertIsNone(pattern.regex.search("Security Architect: Design secure OAuth2 and net banking password storage policies."))
+        self.assertIsNone(pattern.regex.search("Mobile Developer: Implementing UPI PIN entry screen in compliance with NPCI regulations."))
+
+    def test_quotation_validation_abbreviation_clause_splitting_succeeding_negation(self):
+        """Abbreviations like Rs. and INR must not prematurely split clauses and cut off succeeding negation."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+        )
+
+        # Case 1: Exact required phrase with "Rs. 500"
+        content_1 = "Welcome to our careers portal. Registration fee of Rs. 500 is not required for application."
+        finding_1 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="Registration fee",
+            explanation="Fee check",
+        )
+        val_1 = validate_evidence_quotation(finding_1, content_1)
+        self.assertEqual(val_1.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(val_1.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # Case 2: INR with comma and amount
+        content_2 = "Application deposit of INR 1,000 is waived for all candidates."
+        finding_2 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="Application deposit",
+            explanation="Deposit check",
+        )
+        val_2 = validate_evidence_quotation(finding_2, content_2)
+        self.assertEqual(val_2.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(val_2.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+    def test_quotation_validation_assertive_payment_override(self):
+        """Assertive payment demands (mandatory, non-refundable) override unrelated preceding negation."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+        )
+
+        # Case 1: Direct assertive demand
+        content_1 = "The training fee is non-refundable and mandatory."
+        finding_1 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="training fee",
+            explanation="Mandatory fee check",
+        )
+        val_1 = validate_evidence_quotation(finding_1, content_1)
+        self.assertEqual(val_1.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(val_1.status, FindingStatus.EXPLICIT_CLAIM)
+
+        # Case 2: Preceded by unrelated idiom "Make no mistake"
+        content_2 = "Make no mistake, the training fee is non-refundable and mandatory."
+        finding_2 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="training fee",
+            explanation="Mandatory fee check",
+        )
+        val_2 = validate_evidence_quotation(finding_2, content_2)
+        self.assertEqual(val_2.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(val_2.status, FindingStatus.EXPLICIT_CLAIM)
+
+        # Case 3: Preceded by unrelated idiom "Have no doubt"
+        content_3 = "Have no doubt: payment of registration fee is mandatory."
+        finding_3 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="registration fee",
+            explanation="Mandatory fee check",
+        )
+        val_3 = validate_evidence_quotation(finding_3, content_3)
+        self.assertEqual(val_3.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(val_3.status, FindingStatus.EXPLICIT_CLAIM)
+
+    def test_evidence_item_and_detection_result_malformed_deserialization(self):
+        """EvidenceItem and DetectionResult safely handle missing fields, malformed types, and corrupted items."""
+        from app.services.detection import (
+            EvidenceItem,
+            DetectionResult,
+            EvidenceCompleteness,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+        )
+
+        # Partial dict with missing id and explanation safely defaults
+        partial_dict = {
+            "category": "advance_fee",
+            "severity": "HIGH",
+            "status": "EXPLICIT_CLAIM",
+            "source": "DETERMINISTIC_RULE",
+        }
+        item = EvidenceItem.model_validate(partial_dict)
+        self.assertEqual(item.id, "FINDING_UNKNOWN")
+        self.assertEqual(item.explanation, "No explanation provided")
+        self.assertEqual(item.category, ScamCategory.ADVANCE_FEE)
+        self.assertEqual(item.severity, FindingSeverity.HIGH)
+
+        # DetectionResult with corrupt elements in list (strings, numbers, invalid dicts)
+        res_data = {
+            "rule_score": 65,
+            "categories_detected": ["advance_fee", "totally_unknown_scam_xyz"],
+            "evidence_items": [
+                partial_dict,
+                "corrupted_non_dict_string_entry",
+                42,
+                None,
+                {"id": "VALID_2", "category": "task_optimization", "explanation": "Valid task scam"},
+            ],
+            "fallback_explanation": "Test explanation",
+            "evidence_completeness": "HIGH",
+        }
+        res = DetectionResult.model_validate(res_data)
+        self.assertEqual(len(res.evidence_items), 2)  # Corrupted 3 items safely discarded
+        self.assertEqual(res.evidence_items[0].id, "FINDING_UNKNOWN")
+        self.assertEqual(res.evidence_items[1].id, "VALID_2")
+        self.assertEqual(res.categories_detected[0], ScamCategory.ADVANCE_FEE)
+        self.assertEqual(res.categories_detected[1], ScamCategory.UNKNOWN)
+
+    def test_detection_patterns_comprehensive_matrix(self):
+        """Comprehensive verification of positive and negative cases across DETECTION_PATTERNS."""
+        from app.services.detection import DETECTION_PATTERNS
+
+        patterns_by_id = {p.pattern_id: p for p in DETECTION_PATTERNS}
+
+        # 1. ADV_FEE_REGISTRATION
+        p_reg = patterns_by_id["ADV_FEE_REGISTRATION"]
+        self.assertIsNotNone(p_reg.regex.search("Pay an onboarding fee of Rs. 1500"))
+        self.assertIsNotNone(p_reg.regex.search("Uniform fee must be remitted"))
+        self.assertIsNone(p_reg.regex.search("Registration for the annual developer summit is free"))
+
+        # 2. ADV_FEE_SECURITY_DEPOSIT
+        p_dep = patterns_by_id["ADV_FEE_SECURITY_DEPOSIT"]
+        self.assertIsNotNone(p_dep.regex.search("Refundable security deposit of Rs. 3000 is required"))
+        self.assertIsNone(p_dep.regex.search("Salary is deposited into candidate savings account"))
+
+        # 3. CRED_HARVEST_PREMATURE_DOCS
+        p_docs = patterns_by_id["CRED_HARVEST_PREMATURE_DOCS"]
+        self.assertIsNotNone(p_docs.regex.search("Send copy of Aadhaar card photo before interview"))
+        self.assertIsNotNone(p_docs.regex.search("Upload PAN card scan required before interview"))
+        self.assertIsNone(p_docs.regex.search("Submit Aadhaar and PAN during post-offer onboarding background check"))
+
+        # 4. EQUIP_OVERPAY_CHECK_VENDOR
+        p_chk = patterns_by_id["EQUIP_OVERPAY_CHECK_VENDOR"]
+        self.assertIsNotNone(p_chk.regex.search("A cashier check for home office will be sent to buy equipment"))
+        self.assertIsNotNone(p_chk.regex.search("Deposit the check and wire back the remaining excess balance"))
+        self.assertIsNone(p_chk.regex.search("Company provides laptop and equipment via IT department"))
+
+        # 5. TASK_RATING_OPTIMIZATION_QUOTA
+        p_task = patterns_by_id["TASK_RATING_OPTIMIZATION_QUOTA"]
+        self.assertIsNotNone(p_task.regex.search("Reviewing apps daily tasks daily commissions"))
+        self.assertIsNotNone(p_task.regex.search("Like YouTube videos and earn Rs. 500 daily"))
+        self.assertIsNone(p_task.regex.search("Code reviews and pull request tasks conducted daily"))
+
+        # 6. TASK_CRYPTO_VIP_COMMISSION
+        p_crypto = patterns_by_id["TASK_CRYPTO_VIP_COMMISSION"]
+        self.assertIsNotNone(p_crypto.regex.search("Unlock VIP level for prepaid task order with USDT payout"))
+        self.assertIsNone(p_crypto.regex.search("Researching zero-knowledge cryptography algorithms"))
+
+        # 7. COMM_TELEGRAM_ONLY_RECRUITMENT
+        p_tg = patterns_by_id["COMM_TELEGRAM_ONLY_RECRUITMENT"]
+        self.assertIsNotNone(p_tg.regex.search("Contact hiring manager on Telegram @hr_official_2026"))
+        self.assertIsNone(p_tg.regex.search("Follow our company announcements channel on Telegram"))
+
+        # 8. COMM_WHATSAPP_ONLY_RECRUITMENT
+        p_wa = patterns_by_id["COMM_WHATSAPP_ONLY_RECRUITMENT"]
+        self.assertIsNotNone(p_wa.regex.search("For this opening, contact via WhatsApp only"))
+        self.assertIsNone(p_wa.regex.search("Recruiter can be reached via WhatsApp, email or LinkedIn"))
+
+        # 9. SALARY_UNSKILLED_EXORBITANT
+        p_sal = patterns_by_id["SALARY_UNSKILLED_EXORBITANT"]
+        self.assertIsNotNone(p_sal.regex.search("Earn Rs. 25000 daily for simple typing 1 hour from home"))
+        self.assertIsNotNone(p_sal.regex.search("Earn $ 1200 daily for copy paste data entry"))
+        self.assertIsNone(p_sal.regex.search("Earn Rs. 35000 per month for full-time junior analyst"))
+
+    def test_scoring_residual_boost_capping_at_30(self):
+        """Residual score boost from multiple distinct categories is capped at +30."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            calculate_evidence_score,
+        )
+
+        anchor_critical = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,  # Base = 65
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Upfront fee",
+        )
+        # 4 distinct remaining categories each having HIGH severity (+10 each = +40 uncapped)
+        rem_1 = EvidenceItem(
+            id="TASK",
+            category=ScamCategory.TASK_OPTIMIZATION,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.HIGH,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Task scam",
+        )
+        rem_2 = EvidenceItem(
+            id="FAKE",
+            category=ScamCategory.FAKE_RECRUITMENT,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.HIGH,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Fake recruit",
+        )
+        rem_3 = EvidenceItem(
+            id="EQUIP",
+            category=ScamCategory.EQUIPMENT_OVERPAYMENT,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.HIGH,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Overpay",
+        )
+        rem_4 = EvidenceItem(
+            id="CRED",
+            category=ScamCategory.CREDENTIAL_HARVESTING,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.HIGH,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Harvest",
+        )
+
+        # 65 + min(30, 40) = 95 (capped at 95, not 105 or 100)
+        items = [anchor_critical, rem_1, rem_2, rem_3, rem_4]
+        score = calculate_evidence_score(items)
+        self.assertEqual(score, 95)
+
+    def test_adv_fee_registration_distinguishes_payment_demands_from_mere_fee_mentions(self):
+        """ADV_FEE_REGISTRATION requires explicit candidate payment demands; exam fee mentions are LOW."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            calculate_evidence_score,
+            get_verdict,
+        )
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        p_ambig = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_AMBIGUOUS_MENTION")
+
+        # 1. Explicit payment demands (CRITICAL)
+        self.assertIsNotNone(p_reg.regex.search("Candidates must pay a registration fee of Rs. 500."))
+        self.assertIsNotNone(p_reg.regex.search("Pay an onboarding fee of Rs. 1,000."))
+        self.assertIsNotNone(p_reg.regex.search("Documentation fee is mandatory before joining."))
+
+        # 2. Public-sector examination fee mention (does NOT trigger CRITICAL pattern)
+        exam_notice = "The official examination application fee is Rs. 750."
+        self.assertIsNone(p_reg.regex.search(exam_notice))
+        m_ambig = p_ambig.regex.search(exam_notice)
+        self.assertIsNotNone(m_ambig)
+        self.assertEqual(p_ambig.severity, FindingSeverity.LOW)
+        self.assertEqual(p_ambig.default_status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # Scored on its own via to_evidence_item(), examination fee mention is Low Risk
+        item_exam = p_ambig.to_evidence_item(matched_text=m_ambig.group(0))
+        self.assertEqual(item_exam.severity, FindingSeverity.LOW)
+        self.assertEqual(item_exam.status, FindingStatus.AMBIGUOUS_SIGNAL)
+        score = calculate_evidence_score([item_exam])
+        self.assertEqual(score, 10)
+        self.assertEqual(get_verdict(score), "Low Risk")
+
+        # 3. Informational mention without amount or demand
+        self.assertIsNone(p_reg.regex.search("Information regarding application fee schedule."))
+
+    def test_pattern_definition_status_preservation_and_coexistence(self):
+        """PatternDefinition default_status is preserved by quotation validation and coexists cleanly."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+            calculate_evidence_score,
+            get_verdict,
+        )
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        p_ambig = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_AMBIGUOUS_MENTION")
+
+        # 1. "The official examination application fee is Rs. 750." produces LOW + AMBIGUOUS_SIGNAL
+        exam_text = "Notice: The official examination application fee is Rs. 750."
+        m_ambig = p_ambig.regex.search(exam_text)
+        self.assertIsNotNone(m_ambig)
+        item_exam = p_ambig.to_evidence_item(matched_text=m_ambig.group(0))
+        self.assertEqual(item_exam.severity, FindingSeverity.LOW)
+        self.assertEqual(item_exam.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # 2. Quotation validation does NOT change that status to EXPLICIT_CLAIM
+        val_exam = validate_evidence_quotation(item_exam, exam_text)
+        self.assertEqual(val_exam.severity, FindingSeverity.LOW)
+        self.assertEqual(val_exam.status, FindingStatus.AMBIGUOUS_SIGNAL)
+        self.assertEqual(calculate_evidence_score([val_exam]), 10)
+
+        # 3. "Candidates must pay a registration fee of Rs. 500." remains CRITICAL + EXPLICIT_CLAIM
+        crit_text = "Candidates must pay a registration fee of Rs. 500."
+        m_crit = p_reg.regex.search(crit_text)
+        self.assertIsNotNone(m_crit)
+        item_crit = p_reg.to_evidence_item(matched_text=m_crit.group(0))
+        val_crit = validate_evidence_quotation(item_crit, crit_text)
+        self.assertEqual(val_crit.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(val_crit.status, FindingStatus.EXPLICIT_CLAIM)
+        self.assertEqual(calculate_evidence_score([val_crit]), 65)
+
+        # 4. A negated registration-fee statement does NOT become an explicit claim
+        neg_text = "Welcome to our portal. Registration fee is not required."
+        item_neg = EvidenceItem(
+            id=p_reg.pattern_id,
+            category=p_reg.category,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=p_reg.severity,
+            status=p_reg.default_status,
+            matched_text="Registration fee",
+            explanation="Fee check",
+        )
+        val_neg = validate_evidence_quotation(item_neg, neg_text)
+        self.assertEqual(val_neg.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(val_neg.status, FindingStatus.AMBIGUOUS_SIGNAL)
+        self.assertEqual(calculate_evidence_score([val_neg]), 0)
+
+        # 5. Coexistence: Ambiguous finding and Critical finding coexist without overwriting or downgrading
+        combined_text = "Candidates must pay a registration fee of Rs. 500. Note: The official examination application fee is Rs. 750."
+        c_crit = p_reg.to_evidence_item(matched_text=p_reg.regex.search(combined_text).group(0))
+        c_ambig = p_ambig.to_evidence_item(matched_text=p_ambig.regex.search(combined_text).group(0))
+
+        val_c_crit = validate_evidence_quotation(c_crit, combined_text)
+        val_c_ambig = validate_evidence_quotation(c_ambig, combined_text)
+
+        self.assertEqual(val_c_crit.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(val_c_crit.status, FindingStatus.EXPLICIT_CLAIM)
+        self.assertEqual(val_c_ambig.severity, FindingSeverity.LOW)
+        self.assertEqual(val_c_ambig.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # The co-occurring ambiguous fee does NOT downgrade the CRITICAL anchor
+        combined_score = calculate_evidence_score([val_c_crit, val_c_ambig])
+        self.assertEqual(combined_score, 65)
+        self.assertEqual(get_verdict(combined_score), "High Risk")
+
+        # Reversed order produces identical score
+        rev_score = calculate_evidence_score([val_c_ambig, val_c_crit])
+        self.assertEqual(rev_score, 65)
+
+    def test_scoring_untrusted_provenance_and_ambiguous_bounding(self):
+        """Frozen V3.2 rules: UNKNOWN source/category and AMBIGUOUS_SIGNAL cannot trigger High Risk."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            calculate_evidence_score,
+            get_verdict,
+        )
+
+        # 1. UNKNOWN source + CRITICAL severity -> capped at LOW (10)
+        t_unknown_source = EvidenceItem(
+            id="UNTRUSTED_1",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.UNKNOWN,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Untrusted legacy source",
+        )
+        score_1 = calculate_evidence_score([t_unknown_source])
+        self.assertEqual(score_1, 10)
+        self.assertEqual(get_verdict(score_1), "Low Risk")
+
+        # 2. UNKNOWN category + CRITICAL severity -> contributes 0
+        t_unknown_cat = EvidenceItem(
+            id="UNTRUSTED_2",
+            category=ScamCategory.UNKNOWN,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Unrecognized category",
+        )
+        score_2 = calculate_evidence_score([t_unknown_cat])
+        self.assertEqual(score_2, 0)
+        self.assertEqual(get_verdict(score_2), "Low Risk")
+
+        # 3. AMBIGUOUS_SIGNAL + CRITICAL severity -> capped at LOW (10)
+        t_ambiguous = EvidenceItem(
+            id="AMBIG_1",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.AMBIGUOUS_SIGNAL,
+            explanation="Ambiguous signal with benign interpretations",
+        )
+        score_3 = calculate_evidence_score([t_ambiguous])
+        self.assertEqual(score_3, 10)
+        self.assertEqual(get_verdict(score_3), "Low Risk")
+
+        # 4. Mixture: Valid deterministic CRITICAL anchor + untrusted/ambiguous items
+        t_valid_anchor = EvidenceItem(
+            id="VALID_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            explanation="Confirmed upfront fee",
+        )
+        mixture = [t_valid_anchor, t_unknown_source, t_unknown_cat, t_ambiguous]
+        score_mix = calculate_evidence_score(mixture)
+        # Valid anchor = 65; untrusted items are capped at LOW (10) and contribute 0 residual boost
+        self.assertEqual(score_mix, 65)
+        self.assertEqual(get_verdict(score_mix), "High Risk")
+
+    def test_quotation_negation_combined_with_assertive_payment_language(self):
+        """Distinguishes genuine assertive payment demands from negated requirements."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+            is_occurrence_negated,
+        )
+
+        # 1. 'No registration fee is mandatory.' -> DIRECT quantifier negation
+        self.assertTrue(is_occurrence_negated("No ", " is mandatory.", "registration fee"))
+        f1 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="registration fee",
+            explanation="Fee check",
+        )
+        v1 = validate_evidence_quotation(f1, "Important Notice: No registration fee is mandatory.")
+        self.assertEqual(v1.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(v1.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # 2. 'Make no mistake, the training fee is mandatory.' -> UNRELATED idiom does NOT negate
+        self.assertFalse(is_occurrence_negated("Make no mistake, the ", " is mandatory.", "training fee"))
+        f2 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="training fee",
+            explanation="Fee check",
+        )
+        v2 = validate_evidence_quotation(f2, "Make no mistake, the training fee is mandatory.")
+        self.assertEqual(v2.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(v2.status, FindingStatus.EXPLICIT_CLAIM)
+
+        # 3. 'The training fee is mandatory and must be paid.' -> Unambiguous active demand
+        self.assertFalse(is_occurrence_negated("The ", " is mandatory and must be paid.", "training fee"))
+        f3 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="training fee",
+            explanation="Fee check",
+        )
+        v3 = validate_evidence_quotation(f3, "The training fee is mandatory and must be paid.")
+        self.assertEqual(v3.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(v3.status, FindingStatus.EXPLICIT_CLAIM)
+
+        # 4. 'The registration fee is waived.' -> Succeeding negation
+        self.assertTrue(is_occurrence_negated("The ", " is waived.", "registration fee"))
+        f4 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="registration fee",
+            explanation="Fee check",
+        )
+        v4 = validate_evidence_quotation(f4, "The registration fee is waived.")
+        self.assertEqual(v4.severity, FindingSeverity.INFORMATIONAL)
+
+    def test_quotation_contradictory_fee_statement_negated(self):
+        """When text states a fee is not required, it is negated even if contradictory keywords exist."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+            is_occurrence_negated,
+        )
+
+        content = "The training fee is not required and is non-refundable."
+        self.assertTrue(is_occurrence_negated("The ", " is not required and is non-refundable.", "training fee"))
+        f = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="training fee",
+            explanation="Fee check",
+        )
+        val = validate_evidence_quotation(f, content)
+        self.assertEqual(val.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(val.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+    def test_benign_fee_disclaimers_not_flagged_as_critical_demands(self):
+        """Benign disclaimers do not match ADV_FEE_REGISTRATION and are negated in quotation validation."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            DetectionSource,
+            ScamCategory,
+            validate_evidence_quotation,
+        )
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+
+        # 1. 'Our company does not charge registration fees.'
+        d1 = "Our company does not charge registration fees."
+        self.assertIsNone(p_reg.regex.search(d1))
+        f1 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="registration fees",
+            explanation="Fee check",
+        )
+        v1 = validate_evidence_quotation(f1, d1)
+        self.assertEqual(v1.severity, FindingSeverity.INFORMATIONAL)
+
+        # 2. 'No application fee is collected.'
+        d2 = "No application fee is collected."
+        self.assertIsNone(p_reg.regex.search(d2))
+        f2 = EvidenceItem(
+            id="ADV_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="application fee",
+            explanation="Fee check",
+        )
+        v2 = validate_evidence_quotation(f2, d2)
+        self.assertEqual(v2.severity, FindingSeverity.INFORMATIONAL)
+
+
+class TestStage1Fix1MultiParagraphDisclaimers(unittest.TestCase):
+    """
+    Stage 1 Fix 1 Regression Tests:
+      - Warning-framing intra-clause isolation across coordinating conjunctions
+      - Repeated identical matched text with mixed reported-scam vs genuine instructions
+      - Multi-paragraph disclaimer contradiction graph reconciliation (1-to-many, many-to-1, many-to-many)
+      - Five-Tier Entity and Obligation framework (Tier 1 linked, Tier 5 unlinked preserving uncertainty)
+      - Immunity of payment rails and hardware deposits
+      - Internal offset exclusion from serialization
+      - Zero dangling references in contradiction reconciliation
+    """
+
+    def test_coordinated_clause_warning_does_not_leak_across_and(self):
+        """Coordinating conjunction 'and' isolates warning framing from independent mandatory demand."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            DetectionSource,
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            get_verdict,
+            validate_evidence_quotation,
+        )
+
+        text = "Beware of scammers demanding registration fees, and candidates must pay a mandatory onboarding fee."
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+
+        # Match 2: Independent onboarding demand ("candidates must pay a mandatory onboarding fee")
+        m2 = p_reg.regex.search(text)
+        self.assertIsNotNone(m2)
+        f2 = p_reg.to_evidence_item(
+            matched_text=m2.group(0),
+            finding_id="ADV_FEE_REGISTRATION_1",
+            start_pos=m2.start(),
+            end_pos=m2.end(),
+        )
+        val2 = validate_evidence_quotation(f2, text)
+        self.assertEqual(val2.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(val2.status, FindingStatus.EXPLICIT_CLAIM)
+
+        # Match 1: Reported scam demand governed by "Beware of scammers..."
+        # NOTE: f1 is constructed as an EvidenceItem unit because ADV_FEE_REGISTRATION is intentionally
+        # scoped to candidate-directed payment actions (pay|deposit|remit), rather than third-person descriptive
+        # extortion phrases ("demanding registration fees"). This unit test verifies validate_evidence_quotation's
+        # clause-governance behavior on reported-scam quotes when surfaced by AI or upstream extraction.
+        f1 = EvidenceItem(
+            id="ADV_FEE_REGISTRATION",
+            category=p_reg.category,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="demanding registration fees",
+            finding_id="ADV_FEE_REPORTED_1",
+            start_pos=text.find("demanding registration fees"),
+            end_pos=text.find("demanding registration fees") + len("demanding registration fees"),
+        )
+        val1 = validate_evidence_quotation(f1, text)
+        self.assertEqual(val1.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(val1.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # Final score is anchored by the independent mandatory demand (65, High Risk)
+        score = calculate_evidence_score([val1, val2])
+        self.assertEqual(score, 65)
+        self.assertEqual(get_verdict(score), "High Risk")
+
+    def test_repeated_identical_wording_mixed_intent_isolated_by_offsets(self):
+        """Repeated identical matched_text occurrences are distinguished by internal offsets."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            get_verdict,
+            validate_evidence_quotation,
+        )
+
+        text = "Scammers falsely claim candidates must pay a registration fee. However, candidates must pay a registration fee of Rs. 500 for our official study kit."
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        matches = list(p_reg.regex.finditer(text))
+        self.assertEqual(len(matches), 2)
+
+        # Occurrence 1: Governed by "Scammers falsely claim"
+        f1 = p_reg.to_evidence_item(
+            matched_text=matches[0].group(0),
+            finding_id="ADV_FEE_REGISTRATION_1",
+            start_pos=matches[0].start(),
+            end_pos=matches[0].end(),
+        )
+        val1 = validate_evidence_quotation(f1, text)
+        self.assertEqual(val1.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(val1.status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # Occurrence 2: Independent demand following "However,"
+        f2 = p_reg.to_evidence_item(
+            matched_text=matches[1].group(0),
+            finding_id="ADV_FEE_REGISTRATION_2",
+            start_pos=matches[1].start(),
+            end_pos=matches[1].end(),
+        )
+        val2 = validate_evidence_quotation(f2, text)
+        self.assertEqual(val2.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(val2.status, FindingStatus.EXPLICIT_CLAIM)
+
+        # Final score remains 65 (High Risk)
+        score = calculate_evidence_score([val1, val2])
+        self.assertEqual(score, 65)
+        self.assertEqual(get_verdict(score), "High Risk")
+
+    def test_multi_paragraph_disclaimer_reconciles_bidirectional_many_to_many_edges(self):
+        """Reconciles 2 Tier 1 demands contradicted by 1 disclaimer with symmetric edges."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            get_verdict,
+            reconcile_contradictions,
+            validate_evidence_quotation,
+        )
+
+        text = """Selected candidates must pay our company a registration fee of Rs. 2,000.
+
+Selected candidates must pay our company an onboarding fee of Rs. 1,000.
+
+The company does not charge candidates any registration or recruitment fees."""
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        matches = list(p_reg.regex.finditer(text))
+        self.assertEqual(len(matches), 2)
+
+        items = []
+        for i, m in enumerate(matches, 1):
+            it = p_reg.to_evidence_item(
+                matched_text=m.group(0),
+                finding_id=f"ADV_FEE_REGISTRATION_{i}",
+                start_pos=m.start(),
+                end_pos=m.end(),
+            )
+            items.append(validate_evidence_quotation(it, text))
+
+        reconciled = reconcile_contradictions(items, text)
+        self.assertEqual(len(reconciled), 3)
+
+        d1 = next(it for it in reconciled if it.finding_id == "ADV_FEE_REGISTRATION_1")
+        d2 = next(it for it in reconciled if it.finding_id == "ADV_FEE_REGISTRATION_2")
+        disc = next(it for it in reconciled if it.id == "DISCLAIMER_COMPANY_NO_FEE")
+
+        # Both demands remain CRITICAL and EXPLICIT_CLAIM
+        self.assertEqual(d1.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(d1.status, FindingStatus.EXPLICIT_CLAIM)
+        self.assertEqual(d2.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(d2.status, FindingStatus.EXPLICIT_CLAIM)
+        self.assertEqual(disc.severity, FindingSeverity.INFORMATIONAL)
+
+        # Graph symmetry: D1 -> Disc, D2 -> Disc, Disc -> [D1, D2]
+        self.assertEqual(d1.contradicts_finding_ids, [disc.finding_id])
+        self.assertEqual(d2.contradicts_finding_ids, [disc.finding_id])
+        self.assertEqual(disc.contradicts_finding_ids, [d1.finding_id, d2.finding_id])
+
+        # Final score remains 65 (High Risk)
+        score = calculate_evidence_score(reconciled)
+        self.assertEqual(score, 65)
+        self.assertEqual(get_verdict(score), "High Risk")
+
+    def test_one_demand_contradicted_by_multiple_separate_disclaimers(self):
+        """One Tier 1 demand contradicted by 2 separate disclaimers has both pointers."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            calculate_evidence_score,
+            reconcile_contradictions,
+            validate_evidence_quotation,
+        )
+
+        text = """Notice: Our company does not charge any registration fees.
+
+Selected candidates must pay our company a registration fee of Rs. 2,000.
+
+Company Policy: We never charge any recruitment or placement charges."""
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        m = p_reg.regex.search(text)
+        self.assertIsNotNone(m)
+
+        f = p_reg.to_evidence_item(
+            matched_text=m.group(0),
+            finding_id="ADV_FEE_REGISTRATION_1",
+            start_pos=m.start(),
+            end_pos=m.end(),
+        )
+        val = validate_evidence_quotation(f, text)
+
+        reconciled = reconcile_contradictions([val], text)
+        self.assertEqual(len(reconciled), 3)
+
+        d1 = next(it for it in reconciled if it.finding_id == "ADV_FEE_REGISTRATION_1")
+        disclaimers = [it for it in reconciled if it.id == "DISCLAIMER_COMPANY_NO_FEE"]
+        self.assertEqual(len(disclaimers), 2)
+
+        disc_ids = sorted(it.finding_id for it in disclaimers)
+        self.assertEqual(d1.contradicts_finding_ids, disc_ids)
+        for disc in disclaimers:
+            self.assertEqual(disc.contradicts_finding_ids, ["ADV_FEE_REGISTRATION_1"])
+
+        self.assertEqual(d1.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(calculate_evidence_score(reconciled), 65)
+
+    def test_reconciled_r1_tier5_unknown_entity_preserves_uncertainty(self):
+        """Tier 1 employer fee is linked; Tier 5 unspecified processing fee remains unlinked."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            calculate_evidence_score,
+            reconcile_contradictions,
+            validate_evidence_quotation,
+        )
+
+        text = """Selected candidates must pay our company a registration fee of Rs. 2,000.
+
+Candidates must pay an application processing fee of Rs. 500.
+
+The company does not charge candidates any registration fees."""
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        matches = list(p_reg.regex.finditer(text))
+        self.assertEqual(len(matches), 2)
+
+        items = []
+        for i, m in enumerate(matches, 1):
+            it = p_reg.to_evidence_item(
+                matched_text=m.group(0),
+                finding_id=f"ADV_FEE_REGISTRATION_{i}",
+                start_pos=m.start(),
+                end_pos=m.end(),
+            )
+            items.append(validate_evidence_quotation(it, text))
+
+        reconciled = reconcile_contradictions(items, text)
+        d1 = next(it for it in reconciled if it.finding_id == "ADV_FEE_REGISTRATION_1")
+        d2 = next(it for it in reconciled if it.finding_id == "ADV_FEE_REGISTRATION_2")
+        disc = next(it for it in reconciled if it.id == "DISCLAIMER_COMPANY_NO_FEE")
+
+        # Demand 1 (Tier 1 explicit employer) is linked
+        self.assertEqual(d1.contradicts_finding_ids, [disc.finding_id])
+        # Demand 2 (Tier 5 unknown entity) remains strictly unlinked
+        self.assertEqual(d2.contradicts_finding_ids, [])
+        self.assertIn("Unverified charging entity", d2.context_required)
+
+        # Disclaimer links only to Demand 1
+        self.assertEqual(disc.contradicts_finding_ids, [d1.finding_id])
+
+        # Both demands retain CRITICAL 65
+        self.assertEqual(d1.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(d2.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(calculate_evidence_score(reconciled), 65)
+
+    def test_tier4_laptop_deposit_not_associated_with_recruitment_disclaimer(self):
+        """Laptop security deposit (Tier 4) remains unlinked and CRITICAL 65."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            calculate_evidence_score,
+            reconcile_contradictions,
+            validate_evidence_quotation,
+        )
+
+        text = """Candidates must deposit a laptop security deposit of Rs. 10,000 before receiving equipment.
+
+The company does not charge candidates any registration fees."""
+
+        p_dep = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_SECURITY_DEPOSIT")
+        m = p_dep.regex.search(text)
+        self.assertIsNotNone(m)
+
+        f = p_dep.to_evidence_item(
+            matched_text=m.group(0),
+            finding_id="ADV_FEE_SECURITY_DEPOSIT_1",
+            start_pos=m.start(),
+            end_pos=m.end(),
+        )
+        val = validate_evidence_quotation(f, text)
+
+        reconciled = reconcile_contradictions([val], text)
+        dep_item = next(it for it in reconciled if it.finding_id == "ADV_FEE_SECURITY_DEPOSIT_1")
+        self.assertEqual(dep_item.contradicts_finding_ids, [])
+        self.assertEqual(dep_item.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(calculate_evidence_score(reconciled), 65)
+
+    def test_tier3_official_exam_fee_not_treated_as_contradiction(self):
+        """Government examination fee (Tier 3) remains unlinked and bounded at LOW 10."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            reconcile_contradictions,
+            validate_evidence_quotation,
+        )
+
+        text = """The official examination application fee is Rs. 750.
+
+Our recruitment process is completely free of charge."""
+
+        p_ambig = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_AMBIGUOUS_MENTION")
+        m = p_ambig.regex.search(text)
+        self.assertIsNotNone(m)
+
+        f = p_ambig.to_evidence_item(
+            matched_text=m.group(0),
+            finding_id="ADV_FEE_AMBIGUOUS_MENTION_1",
+            start_pos=m.start(),
+            end_pos=m.end(),
+        )
+        val = validate_evidence_quotation(f, text)
+
+        reconciled = reconcile_contradictions([val], text)
+        exam_item = next(it for it in reconciled if it.finding_id == "ADV_FEE_AMBIGUOUS_MENTION_1")
+        self.assertEqual(exam_item.contradicts_finding_ids, [])
+        self.assertEqual(exam_item.severity, FindingSeverity.LOW)
+        self.assertEqual(exam_item.status, FindingStatus.AMBIGUOUS_SIGNAL)
+        self.assertEqual(calculate_evidence_score(reconciled), 10)
+
+    def test_private_offsets_excluded_from_model_dump_and_json(self):
+        """Internal start_pos and end_pos are preserved in-memory but excluded from serialization."""
+        from app.services.detection import EvidenceItem
+
+        item = EvidenceItem(
+            id="ADV_FEE_REGISTRATION",
+            finding_id="ADV_FEE_REGISTRATION_1",
+            matched_text="fee of Rs. 500",
+            start_pos=45,
+            end_pos=80,
+        )
+        self.assertEqual(item.start_pos, 45)
+        self.assertEqual(item.end_pos, 80)
+
+        dumped = item.model_dump()
+        self.assertNotIn("start_pos", dumped)
+        self.assertNotIn("end_pos", dumped)
+        self.assertNotIn("_start_pos", dumped)
+        self.assertNotIn("_end_pos", dumped)
+
+        json_str = item.model_dump_json()
+        self.assertNotIn("start_pos", json_str)
+        self.assertNotIn("end_pos", json_str)
+
+    def test_dangling_reference_rejection_in_contradiction_graph(self):
+        """Reconciliation rejects non-existent target IDs, guaranteeing zero dangling references."""
+        from app.services.detection import (
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            ScamCategory,
+            DetectionSource,
+            reconcile_contradictions,
+        )
+
+        d1 = EvidenceItem(
+            id="ADV_FEE_REGISTRATION",
+            finding_id="ADV_FEE_REGISTRATION_1",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="pay our company a registration fee",
+            start_pos=10,
+            end_pos=44,
+        )
+
+        # Single item with no disclaimer in document
+        reconciled = reconcile_contradictions([d1], "Please pay our company a registration fee.")
+        item = reconciled[0]
+        self.assertEqual(item.contradicts_finding_ids, [])
+        for tid in item.contradicts_finding_ids:
+            self.fail(f"Dangling target ID detected: {tid}")
+
+    def test_end_to_end_coordinated_clause_warning_does_not_leak_across_and(self):
+        """End-to-end pipeline test: regex finditer discovers both clauses; warning does not leak."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            get_verdict,
+            validate_evidence_quotation,
+        )
+
+        text = (
+            "Beware of scammers claiming candidates must pay a registration fee, "
+            "and candidates must pay a mandatory onboarding fee."
+        )
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        matches = list(p_reg.regex.finditer(text))
+        self.assertEqual(len(matches), 2)
+
+        items = []
+        for i, m in enumerate(matches, 1):
+            it = p_reg.to_evidence_item(
+                matched_text=m.group(0),
+                finding_id=f"ADV_FEE_REGISTRATION_{i}",
+                start_pos=m.start(),
+                end_pos=m.end(),
+            )
+            items.append(validate_evidence_quotation(it, text))
+
+        self.assertEqual(len(items), 2)
+        # Occurrence 1 is governed by 'Beware of scammers claiming'
+        self.assertEqual(items[0].severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(items[0].status, FindingStatus.AMBIGUOUS_SIGNAL)
+
+        # Occurrence 2 is independent across ', and'
+        self.assertEqual(items[1].severity, FindingSeverity.CRITICAL)
+        self.assertEqual(items[1].status, FindingStatus.EXPLICIT_CLAIM)
+
+        # Unified score anchored by Occurrence 2 at 65 (High Risk)
+        score = calculate_evidence_score(items)
+        self.assertEqual(score, 65)
+        self.assertEqual(get_verdict(score), "High Risk")
+
+    def test_urgent_warning_header_does_not_suppress_genuine_fee_demand(self):
+        """Urgent demand header 'Warning:' does not suppress genuine fee demand, while real scam alerts are downgraded."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            DetectionSource,
+            EvidenceItem,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            get_verdict,
+            validate_evidence_quotation,
+        )
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+
+        # 1. Urgent demand with 'Warning:' header: must NOT be suppressed
+        text1 = "Warning: Candidates must pay a registration fee before 5 PM to confirm selection."
+        m1 = p_reg.regex.search(text1)
+        self.assertIsNotNone(m1)
+        f1 = p_reg.to_evidence_item(
+            matched_text=m1.group(0),
+            finding_id="ADV_FEE_REGISTRATION_1",
+            start_pos=m1.start(),
+            end_pos=m1.end(),
+        )
+        val1 = validate_evidence_quotation(f1, text1)
+        self.assertEqual(val1.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(val1.status, FindingStatus.EXPLICIT_CLAIM)
+        self.assertEqual(calculate_evidence_score([val1]), 65)
+        self.assertEqual(get_verdict(65), "High Risk")
+
+        # 2. Genuine scam reporting with 'Fraud alert:'
+        text2 = "Fraud alert: Scammers are demanding registration fees."
+        f2 = EvidenceItem(
+            id="ADV_FEE_REGISTRATION",
+            category=p_reg.category,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="demanding registration fees",
+            start_pos=text2.find("demanding registration fees"),
+            end_pos=text2.find("demanding registration fees") + len("demanding registration fees"),
+        )
+        val2 = validate_evidence_quotation(f2, text2)
+        self.assertEqual(val2.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(val2.status, FindingStatus.AMBIGUOUS_SIGNAL)
+        self.assertEqual(calculate_evidence_score([val2]), 0)
+
+        # 3. Genuine scam reporting with 'Beware of scammers falsely claiming'
+        text3 = "Beware of scammers falsely claiming candidates must pay registration fees."
+        m3 = p_reg.regex.search(text3)
+        self.assertIsNotNone(m3)
+        f3 = p_reg.to_evidence_item(
+            matched_text=m3.group(0),
+            finding_id="ADV_FEE_REGISTRATION_3",
+            start_pos=m3.start(),
+            end_pos=m3.end(),
+        )
+        val3 = validate_evidence_quotation(f3, text3)
+        self.assertEqual(val3.severity, FindingSeverity.INFORMATIONAL)
+        self.assertEqual(val3.status, FindingStatus.AMBIGUOUS_SIGNAL)
+        self.assertEqual(calculate_evidence_score([val3]), 0)
+
+    def test_tier2_explicit_agency_repudiation_links_bidirectionally(self):
+        """Scenario A: Explicit agency repudiation links bidirectionally with agency fee demand."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            get_verdict,
+            reconcile_contradictions,
+            validate_evidence_quotation,
+        )
+
+        text = """We do not authorize any agency to collect recruitment fees.
+
+Selected candidates: Pay ABC Placement Agency Rs. 1,000."""
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        m = p_reg.regex.search(text)
+        self.assertIsNotNone(m)
+
+        f = p_reg.to_evidence_item(
+            matched_text=m.group(0),
+            finding_id="ADV_FEE_REGISTRATION_1",
+            start_pos=m.start(),
+            end_pos=m.end(),
+        )
+        val = validate_evidence_quotation(f, text)
+
+        reconciled = reconcile_contradictions([val], text)
+        self.assertEqual(len(reconciled), 2)
+
+        agency_demand = next(it for it in reconciled if it.id == "ADV_FEE_REGISTRATION")
+        disc = next(it for it in reconciled if it.id == "DISCLAIMER_COMPANY_NO_FEE")
+
+        # Bidirectional links
+        self.assertEqual(agency_demand.contradicts_finding_ids, [disc.finding_id])
+        self.assertEqual(disc.contradicts_finding_ids, [agency_demand.finding_id])
+
+        # Original demand remains CRITICAL / EXPLICIT_CLAIM (score: 65)
+        self.assertEqual(agency_demand.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(agency_demand.status, FindingStatus.EXPLICIT_CLAIM)
+        self.assertEqual(disc.severity, FindingSeverity.INFORMATIONAL)
+        score = calculate_evidence_score(reconciled)
+        self.assertEqual(score, 65)
+        self.assertEqual(get_verdict(score), "High Risk")
+
+    def test_tier2_generic_disclaimer_does_not_link_agency_demand(self):
+        """Scenario B: Generic employer disclaimer does not link to third-party agency demand."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            get_verdict,
+            reconcile_contradictions,
+            validate_evidence_quotation,
+        )
+
+        text = """Our company does not charge candidates any recruitment fees.
+
+Selected candidates: Pay ABC Placement Agency Rs. 1,000."""
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        m = p_reg.regex.search(text)
+        self.assertIsNotNone(m)
+
+        f = p_reg.to_evidence_item(
+            matched_text=m.group(0),
+            finding_id="ADV_FEE_REGISTRATION_1",
+            start_pos=m.start(),
+            end_pos=m.end(),
+        )
+        val = validate_evidence_quotation(f, text)
+
+        reconciled = reconcile_contradictions([val], text)
+        self.assertEqual(len(reconciled), 2)
+
+        agency_demand = next(it for it in reconciled if it.id == "ADV_FEE_REGISTRATION")
+        disc = next(it for it in reconciled if it.id == "DISCLAIMER_COMPANY_NO_FEE")
+
+        # No contradiction links
+        self.assertEqual(agency_demand.contradicts_finding_ids, [])
+        self.assertEqual(disc.contradicts_finding_ids, [])
+
+        # Tier 2 context preserved
+        self.assertIn("Independent agency fee", agency_demand.context_required)
+
+        # Original demand remains CRITICAL / EXPLICIT_CLAIM (score: 65)
+        self.assertEqual(agency_demand.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(agency_demand.status, FindingStatus.EXPLICIT_CLAIM)
+        score = calculate_evidence_score(reconciled)
+        self.assertEqual(score, 65)
+        self.assertEqual(get_verdict(score), "High Risk")
+
+    def test_tier5_unknown_charging_entity_preserves_uncertainty(self):
+        """Scenario C: Unknown charging entity remains unlinked and preserves uncertainty."""
+        from app.services.detection import (
+            DETECTION_PATTERNS,
+            FindingSeverity,
+            FindingStatus,
+            calculate_evidence_score,
+            get_verdict,
+            reconcile_contradictions,
+            validate_evidence_quotation,
+        )
+
+        text = """Our company does not charge candidates any recruitment fees.
+
+Candidates must pay an application processing fee of Rs. 500."""
+
+        p_reg = next(p for p in DETECTION_PATTERNS if p.pattern_id == "ADV_FEE_REGISTRATION")
+        m = p_reg.regex.search(text)
+        self.assertIsNotNone(m)
+
+        f = p_reg.to_evidence_item(
+            matched_text=m.group(0),
+            finding_id="ADV_FEE_REGISTRATION_1",
+            start_pos=m.start(),
+            end_pos=m.end(),
+        )
+        val = validate_evidence_quotation(f, text)
+
+        reconciled = reconcile_contradictions([val], text)
+        self.assertEqual(len(reconciled), 2)
+
+        unknown_demand = next(it for it in reconciled if it.id == "ADV_FEE_REGISTRATION")
+        disc = next(it for it in reconciled if it.id == "DISCLAIMER_COMPANY_NO_FEE")
+
+        # No contradiction links based solely on vocabulary
+        self.assertEqual(unknown_demand.contradicts_finding_ids, [])
+        self.assertEqual(disc.contradicts_finding_ids, [])
+
+        # Tier 5 uncertainty preserved
+        self.assertIn("Unverified charging entity", unknown_demand.context_required)
+
+        # Original demand remains CRITICAL
+        self.assertEqual(unknown_demand.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(unknown_demand.status, FindingStatus.EXPLICIT_CLAIM)
+        score = calculate_evidence_score(reconciled)
+        self.assertEqual(score, 65)
+        self.assertEqual(get_verdict(score), "High Risk")
+
+
 if __name__ == "__main__":
     unittest.main()
