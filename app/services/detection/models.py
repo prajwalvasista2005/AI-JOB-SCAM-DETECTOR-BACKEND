@@ -1,8 +1,8 @@
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, NamedTuple
 import logging
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,7 @@ class FindingSeverity(str, Enum):
     CRITICAL = "CRITICAL"          # Base Anchor = 65 (Immediate High Risk)
     HIGH = "HIGH"                  # Base Anchor = 45 (Upper Medium Risk)
     MEDIUM = "MEDIUM"              # Base Anchor = 25 (Lower Medium Risk)
+    SUSPICIOUS = "MEDIUM"          # Backward-compatibility alias for lower-medium severity
     LOW = "LOW"                    # Base Anchor = 10 (Low Risk)
     INFORMATIONAL = "INFORMATIONAL"# Base Anchor = 0  (Zero Score Contribution)
 
@@ -45,6 +46,48 @@ class EvidenceCompleteness(str, Enum):
     LOW = "LOW"            # Sparse or truncated text: high uncertainty due to missing information
 
 
+class CandidateEligibility(str, Enum):
+    SCORABLE_ACTIVE = "SCORABLE_ACTIVE"
+    SCORABLE_AMBIGUOUS = "SCORABLE_AMBIGUOUS"
+    NON_SCORABLE_INFORMATIONAL = "NON_SCORABLE_INFORMATIONAL"
+    NON_SCORABLE_CONTEXTUAL = "NON_SCORABLE_CONTEXTUAL"
+    REJECTED = "REJECTED"
+
+
+class RejectionReason(str, Enum):
+    INTERVAL_INVALID = "INTERVAL_INVALID"
+    INTERVAL_EMPTY = "INTERVAL_EMPTY"
+    BOUNDS_OUT_OF_RANGE = "BOUNDS_OUT_OF_RANGE"
+    SEGMENT_BOUNDARY_VIOLATED = "SEGMENT_BOUNDARY_VIOLATED"
+    QUOTATION_MISMATCH = "QUOTATION_MISMATCH"
+    QUOTATION_EMPTY_OR_WHITESPACE = "QUOTATION_EMPTY_OR_WHITESPACE"
+    QUOTATION_TOO_LONG = "QUOTATION_TOO_LONG"
+    NORMALIZED_MISMATCH = "NORMALIZED_MISMATCH"
+    DESCRIPTIVE_NOT_DIRECTIVE = "DESCRIPTIVE_NOT_DIRECTIVE"
+    HISTORICAL_REPORT = "HISTORICAL_REPORT"
+    DISCRETIONARY_NOT_MANDATORY = "DISCRETIONARY_NOT_MANDATORY"
+    NON_FINANCIAL_ACTION = "NON_FINANCIAL_ACTION"
+    COMPETING_OBJECT_BOUND = "COMPETING_OBJECT_BOUND"
+    SUBORDINATE_CLAUSE_ISOLATED = "SUBORDINATE_CLAUSE_ISOLATED"
+    SELF_AUTH_NOT_DISCLOSURE = "SELF_AUTH_NOT_DISCLOSURE"
+    NO_RECRUITMENT_CONTEXT = "NO_RECRUITMENT_CONTEXT"
+    NO_GOVERNING_VERB = "NO_GOVERNING_VERB"
+    UNVERIFIED_PROVENANCE = "UNVERIFIED_PROVENANCE"
+    CONTRADICTORY_PROVENANCE = "CONTRADICTORY_PROVENANCE"
+    UNTRUSTED_SOURCE = "UNTRUSTED_SOURCE"
+    UNSUPPORTED_CATEGORY = "UNSUPPORTED_CATEGORY"
+    NON_ACTIONABLE_SEVERITY = "NON_ACTIONABLE_SEVERITY"
+
+
+class TextSegment(NamedTuple):
+    text: str
+    source_intervals: list[tuple[int, int]]
+    raw_start: int
+    raw_end: int
+    segment_index: int
+    script: str
+
+
 class EvidenceItem(BaseModel):
     id: str = Field(default="FINDING_UNKNOWN", description="Machine-readable finding identifier, e.g. ADV_FEE_UPI_DIRECT")
     category: ScamCategory = ScamCategory.UNKNOWN
@@ -58,6 +101,16 @@ class EvidenceItem(BaseModel):
     contradicts_finding_ids: list[str] = Field(default_factory=list, description="IDs of contradicted evidence instances")
     start_pos: int | None = Field(default=None, exclude=True, description="Internal start character offset")
     end_pos: int | None = Field(default=None, exclude=True, description="Internal end character offset")
+    eligibility: CandidateEligibility = Field(
+        default=CandidateEligibility.REJECTED,
+        exclude=True,
+        description="Internal scoring eligibility decision",
+    )
+    rejection_reason: RejectionReason | None = Field(
+        default=None,
+        exclude=True,
+        description="Internal provenance or quotation rejection reason",
+    )
 
     model_config = ConfigDict(from_attributes=True, extra="ignore")
 
@@ -121,6 +174,105 @@ class EvidenceItem(BaseModel):
         if not isinstance(v, list):
             return []
         return [str(x).strip() for x in v if x and str(x).strip()]
+
+    @field_validator("eligibility", mode="before")
+    @classmethod
+    def sanitize_eligibility(cls, v: Any) -> CandidateEligibility:
+        valid = {e.value for e in CandidateEligibility}
+        val = v.value if hasattr(v, "value") else str(v).strip().upper()
+        if val in valid:
+            return CandidateEligibility(val)
+        return CandidateEligibility.REJECTED
+
+    @model_validator(mode="after")
+    def _validate_eligibility_and_provenance(self) -> "EvidenceItem":
+        # 1. Capture whether caller explicitly passed eligibility BEFORE any mutation
+        was_explicitly_set = "eligibility" in self.model_fields_set
+
+        # 2. If caller explicitly passed a non-scorable state (or explicit None / invalid string), preserve rejection
+        if was_explicitly_set:
+            if self.eligibility in (
+                CandidateEligibility.REJECTED,
+                CandidateEligibility.NON_SCORABLE_INFORMATIONAL,
+                CandidateEligibility.NON_SCORABLE_CONTEXTUAL,
+            ):
+                return self
+
+        # 3. Provenance completeness check for scorable eligibility
+        required_provenance = {"category", "source", "severity", "status"}
+        if not required_provenance.issubset(self.model_fields_set):
+            self.eligibility = CandidateEligibility.REJECTED
+            self.rejection_reason = RejectionReason.UNVERIFIED_PROVENANCE
+            return self
+
+        # 4. Provenance validity checks
+        active_severities = {
+            FindingSeverity.SUSPICIOUS,
+            FindingSeverity.HIGH,
+            FindingSeverity.CRITICAL,
+        }
+        trusted_sources = {
+            DetectionSource.DETERMINISTIC_RULE,
+            DetectionSource.RULE_AND_AI,
+            DetectionSource.AI_INFERENCE,
+        }
+
+        # Branch A: SCORABLE_ACTIVE (Strictly active severities & explicit claims)
+        if (
+            self.category != ScamCategory.UNKNOWN
+            and self.source in trusted_sources
+            and self.severity in active_severities
+            and self.status == FindingStatus.EXPLICIT_CLAIM
+        ):
+            if was_explicitly_set:
+                if self.eligibility == CandidateEligibility.SCORABLE_ACTIVE:
+                    self.rejection_reason = None
+                    return self
+                else:
+                    self.eligibility = CandidateEligibility.REJECTED
+                    self.rejection_reason = RejectionReason.CONTRADICTORY_PROVENANCE
+                    return self
+            self.eligibility = CandidateEligibility.SCORABLE_ACTIVE
+            self.rejection_reason = None
+            return self
+
+        # Branch B: SCORABLE_AMBIGUOUS (Independent branches: Active Ambiguous vs. Low Ambiguous)
+        is_active_ambiguous = (
+            self.category != ScamCategory.UNKNOWN
+            and self.severity in active_severities
+            and (self.status == FindingStatus.AMBIGUOUS_SIGNAL or self.source == DetectionSource.UNKNOWN)
+        )
+        is_low_ambiguous = (
+            self.category != ScamCategory.UNKNOWN
+            and self.source in trusted_sources
+            and self.severity == FindingSeverity.LOW
+            and self.status == FindingStatus.AMBIGUOUS_SIGNAL
+        )
+
+        if is_active_ambiguous or is_low_ambiguous:
+            if was_explicitly_set:
+                if self.eligibility == CandidateEligibility.SCORABLE_AMBIGUOUS:
+                    self.rejection_reason = None
+                    return self
+                else:
+                    self.eligibility = CandidateEligibility.REJECTED
+                    self.rejection_reason = RejectionReason.CONTRADICTORY_PROVENANCE
+                    return self
+            self.eligibility = CandidateEligibility.SCORABLE_AMBIGUOUS
+            self.rejection_reason = None
+            return self
+
+        # Fail-closed rejection for all other combinations
+        self.eligibility = CandidateEligibility.REJECTED
+        if self.category == ScamCategory.UNKNOWN:
+            self.rejection_reason = RejectionReason.UNSUPPORTED_CATEGORY
+        elif self.source not in trusted_sources:
+            self.rejection_reason = RejectionReason.UNTRUSTED_SOURCE
+        elif self.severity not in active_severities and self.severity != FindingSeverity.LOW:
+            self.rejection_reason = RejectionReason.NON_ACTIONABLE_SEVERITY
+        else:
+            self.rejection_reason = RejectionReason.UNVERIFIED_PROVENANCE
+        return self
 
     @classmethod
     def safe_parse(cls, data: Any) -> "EvidenceItem | None":

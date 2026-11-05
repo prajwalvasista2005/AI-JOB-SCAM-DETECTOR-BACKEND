@@ -47,6 +47,7 @@ DISCLAIMER_IMMUNE_IDS: set[str] = {
     "CRED_HARVEST_AUTH_SECRETS",    # OTP / PIN credential theft can never be excused
     "EQUIP_OVERPAY_CHECK_VENDOR",   # Cashier's check overpayment fraud can never be excused
     "ADV_FEE_SECURITY_DEPOSIT",     # Equipment/hardware deposits cannot be excused by recruitment disclaimer
+    "ADV_FEE_REVERSE_AUTH",         # Deceptive reverse collect requests cannot be excused
 }
 
 # Pre-compiled regex for company-wide no-fee disclaimers
@@ -56,8 +57,9 @@ COMPANY_FEE_DISCLAIMER_RE = re.compile(
     r"(?:charge|asks?\s+(?:candidates?|applicants?|anyone)?\s*for|collect\s+(?:from\s+(?:candidates?|applicants?))?|demand|require|accept)\s+"
     r"(?:(?:candidates?|applicants?|job\s*seekers?|anyone)\s+)?"
     r"(?:any\s+)?"
-    r"(?:(?:registration|recruitment|application|placement|processing|hiring|interview|selection|onboarding|upfront)\s*(?:(?:or|and|,)\s*)?)*\s*"
+    r"(?:(?:registration|recruitment|application|placement|processing|hiring|interview|selection|onboarding|upfront)\s*(?:(?:or|and|,)\s*)?){0,6}\s*"
     r"(?:fees?|charges?|money|deposits?|payments?)\b"
+    r"|\b(?:our\s+company|the\s+company|we|organization|employer|recruiter|firm)\s+(?:does\s+not|do\s+not|never)\s+charge\s+(?:candidates?|applicants?|job\s*seekers?|anyone)\b"
     r"|\b(?:we\s+do\s+not|never)\s+(?:charge|ask\s+for|collect|demand)\s+(?:any\s+)?(?:fees?|charges?|money|deposits?)\s+(?:for|during|at|towards)\s+(?:recruitment|hiring|interviews?|selection|placement|jobs?|applications?)\b"
     r"|\b(?:we|our\s+company|the\s+company)\s+(?:do\s+not|does\s+not|never)\s+(?:authorize|permit|allow|employ)\s+(?:any\s+)?(?:agenc(?:y|ies)|consultanc(?:y|ies)|consultants?|agents?|third\s*part(?:y|ies))\s+(?:to\s+)?(?:charge|collect|demand|ask\s+for|take)\s+(?:any\s+)?(?:(?:registration|recruitment|placement|application|processing|onboarding)\s+)?(?:fees?|charges?|money|deposits?|payments?)\b"
     r"|\bno\s+(?:agenc(?:y|ies)|consultanc(?:y|ies)|consultants?|agents?|third\s*part(?:y|ies))\s+(?:is|are)\s+authorized\s+to\s+(?:charge|collect|demand|ask\s+for|accept)\s+(?:any\s+)?(?:(?:registration|recruitment|placement|application|processing|onboarding)\s+)?(?:fees?|charges?|money|payments?)\b"
@@ -80,8 +82,11 @@ DETECTION_PATTERNS: list[PatternDefinition] = [
             # Explicit candidate payment demand for registration, application, onboarding, document, gate pass or uniform fee
             r"\b(?:pay|deposit|transfer|remit)\s+(?:(?:to\s+)?(?:our\s+company|the\s+company|us)\s+)?(?:(?:a|an|the)?\s*(?:non[-\s]refundable\s+)?)?(?:registration|recruitment|placement|application(?:\s+processing)?|onboarding|documentation|processing|gate\s+pass|uniform)\s+(?:fees?|charges?)\b"
             r"|\b(?:registration|recruitment|placement|application(?:\s+processing)?|onboarding|documentation|processing|gate\s+pass|uniform)\s+(?:fees?|charges?)\s*(?:of\s+(?:rs\.?|inr|\$|£|€)?\s*\d+(?:,\d+)*)?\s*(?:is\s+)?(?:required|mandatory|compulsory|payable|must\s+be\s+(?:paid|remitted|deposited|transferred))\b"
-            r"|\b(?:candidates?|applicants?)\s+must\s+(?:pay|deposit|remit|submit)\s+(?:(?:to\s+)?(?:our\s+company|the\s+company|us)\s+)?(?:(?:a|an)\s+)?(?:(?:non[-\s]refundable|mandatory|compulsory)\s+)?(?:registration|recruitment|placement|application(?:\s+processing)?|onboarding|documentation|processing)\s+(?:fee|charge)s?\b"
-            r"|\b(?:pay|deposit|transfer|remit)\s+(?:to\s+)?(?:[a-zA-Z0-9\.\-_]+\s+)*(?:agency|consultancy|placement\s+agency|firm)\s+(?:(?:a|an|the)?\s*(?:non[-\s]refundable\s+)?(?:fee|charge)s?\s*(?:of\s+)?)?(?:rs\.?|inr|\$|£|€)\s*\d+(?:,\d+)*\b",
+            r"|\b(?:candidates?|applicants?)\s+must\s+(?:pay|deposit|remit|submit)\s+(?:(?:to\s+)?(?:our\s+company|the\s+company|us)\s+)?(?:(?:a|an|the)?\s*)?(?:(?:non[-\s]refundable|mandatory|compulsory|official)\s+)?(?:registration|recruitment|placement|application(?:\s+processing)?|onboarding|documentation|processing)\s+(?:fee|charge)s?\s*(?:of\s+(?:rs\.?|inr|\$|£|€)?\s*\d+(?:,\d+)*)?\b"
+            r"|\b(?:pay|deposit|transfer|remit)\s+(?:(?:rs\.?|inr|\$|£|€)\s*\d+(?:,\d+)*\s+)?(?:directly\s+)?(?:to\s+|into\s+)?(?:our\s+company|the\s+company|our\s+firm|the\s+firm|our\s+organization|us)\b"
+            r"|\b(?:our\s+company|the\s+company|our\s+firm|our\s+organization|our\s+hr|we)\s+(?:collects?|charges?|requires?|demands?|asks?\s+for|takes?)\s+(?:(?:a|an|the|any)?\s*(?:non[-\s]refundable|mandatory|compulsory|upfront)?\s*)?(?:(?:rs\.?|inr|\$|£|€)?\s*\d+(?:,\d+)*\s+)?(?:registration|recruitment|placement|application(?:\s+processing)?|onboarding|documentation|processing)\s+(?:fees?|charges?)\b"
+            r"|\b(?:pay|deposit|transfer|remit)\s+(?:(?:rs\.?|inr|\$|£|€)\s*\d+(?:,\d+)*\s+)?(?:to\s+)?(?:(?!pay\b|to\b)[a-zA-Z0-9_\-]+\s+){0,4}(?:agency|consultancy|placement\s+agency|staffing\s+firm|firm)\s*(?:(?:a|an|the)?\s*(?:non[-\s]refundable\s+)?(?:fee|charge)s?\s*(?:of\s+)?)?(?:(?:rs\.?|inr|\$|£|€)\s*\d+(?:,\d+)*)?\b"
+            r"|\b(?:(?:our|the|[a-zA-Z0-9\.\-_]+)\s+)?(?:agency|consultancy|placement\s+agency|staffing\s+firm)\s+(?:collects?|charges?|demands?|requires?|takes?)\s+(?:(?:a|an|the|any)?\s*(?:non[-\s]refundable|mandatory|compulsory|upfront)?\s*)?(?:(?:rs\.?|inr|\$|£|€)?\s*\d+(?:,\d+)*\s+)?(?:registration|recruitment|placement|application(?:\s+processing)?|onboarding|documentation|processing)?\s*(?:fees?|charges?)\b",
             re.IGNORECASE,
         ),
         explanation="Explicit demand for candidate to pay upfront registration, document, or onboarding fees.",
@@ -122,6 +127,17 @@ DETECTION_PATTERNS: list[PatternDefinition] = [
             re.IGNORECASE,
         ),
         explanation="Direct payment demand via peer-to-peer UPI, QR code, or informal payment rail for employment.",
+    ),
+    PatternDefinition(
+        pattern_id="ADV_FEE_REVERSE_AUTH",
+        category=ScamCategory.ADVANCE_FEE,
+        severity=FindingSeverity.CRITICAL,
+        regex=re.compile(
+            r"\b(?:approve|accept)\s+(?:(?:the|any|your)?\s*)?(?:upi\s+)?collect\s+requests?\s+(?:to\s+(?:receive|get|claim)\s+(?:money|payment|salary|funds?)|for\s+salary)\b"
+            r"|\b(?:salary|funds?|payment)\s+(?:credit|transfer|receive)\s+karne\s+ke\s+liye\s+upi\s+collect\s+request\s+approve\s+karo\b",
+            re.IGNORECASE,
+        ),
+        explanation="Deceptive reverse collect request instructing candidate to approve UPI debit to receive funds.",
     ),
 
     # -------------------------------------------------------------------------
@@ -177,7 +193,7 @@ DETECTION_PATTERNS: list[PatternDefinition] = [
         category=ScamCategory.TASK_OPTIMIZATION,
         severity=FindingSeverity.HIGH,
         regex=re.compile(
-            r"\b(?:rating|reviewing)\s+(?:apps|hotels|products|maps)\b.*\b(?:daily\s+tasks?|daily\s+commissions?|payouts?)\b"
+            r"\b(?:rating|reviewing)\s+(?:apps|hotels|products|maps)\b[^\n.!?]{0,80}\b(?:daily\s+tasks?|daily\s+commissions?|payouts?)\b"
             r"|\bcomplete\s+\d+\s+(?:sets?\s+of\s+)?(?:tasks?|orders?)\s+daily\b"
             r"|\b(?:like|subscribe)\s+(?:youtube\s+videos?|channels?)\s+(?:and\s+earn|earn\s+rs\.?)\b",
             re.IGNORECASE,

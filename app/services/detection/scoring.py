@@ -1,4 +1,5 @@
 from app.services.detection.models import (
+    CandidateEligibility,
     DetectionSource,
     EvidenceItem,
     FindingSeverity,
@@ -17,13 +18,26 @@ SEVERITY_WEIGHTS: dict[FindingSeverity, int] = {
 
 def get_effective_weight(item: EvidenceItem) -> int:
     """
-    Computes effective weight according to frozen V3.2 provenance and evidence rules:
+    Computes effective weight according to fail-closed provenance and evidence rules:
       - UNKNOWN category: 0 (unrecognized scam category cannot anchor or compound).
+      - CONTEXTUAL_INFERENCE status: 0 (unquoted, fabricated, or contextual-only evidence cannot increase score).
+      - INFORMATIONAL severity: 0 (zero score contribution).
       - AMBIGUOUS_SIGNAL status: capped at LOW (10) because benign interpretations exist.
       - UNKNOWN source: capped at LOW (10) because untrusted provenance has no special trust.
-      - Valid findings: full severity weight.
+      - Non-scorable eligibility: 0.
+      - Valid grounded findings: full severity weight.
     """
     if item.category == ScamCategory.UNKNOWN:
+        return 0
+
+    if item.status == FindingStatus.CONTEXTUAL_INFERENCE:
+        return 0
+
+    eligibility = getattr(item, "eligibility", None)
+    if eligibility not in (
+        CandidateEligibility.SCORABLE_ACTIVE,
+        CandidateEligibility.SCORABLE_AMBIGUOUS,
+    ):
         return 0
 
     base_weight = SEVERITY_WEIGHTS.get(item.severity, 0)
@@ -31,7 +45,7 @@ def get_effective_weight(item: EvidenceItem) -> int:
         return 0
 
     # Ambiguous signals cannot anchor above LOW
-    if item.status == FindingStatus.AMBIGUOUS_SIGNAL:
+    if item.status == FindingStatus.AMBIGUOUS_SIGNAL or eligibility == CandidateEligibility.SCORABLE_AMBIGUOUS:
         base_weight = min(base_weight, SEVERITY_WEIGHTS[FindingSeverity.LOW])
 
     # Unknown provenance cannot anchor above LOW
