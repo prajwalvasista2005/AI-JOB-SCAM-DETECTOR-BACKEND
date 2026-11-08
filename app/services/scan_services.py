@@ -1,5 +1,8 @@
+import json
 import logging
 import re
+import time
+from typing import Any
 import unicodedata
 from urllib.parse import urlparse
 from sqlalchemy import select
@@ -7,6 +10,9 @@ from sqlalchemy.orm import Session
 
 from app.models.scan import Scan
 from app.schemas.scan import AnalysisMode, InputType
+from app.services.detection.models import DetectionResult, EvidenceItem
+from app.services.detection.scoring import get_effective_weight
+from app.services.detection.service import analyze_job_posting
 from app.services.gemini_service import (
     EXTRACTION_FIELDS,
     analyze_job_content,
@@ -14,6 +20,26 @@ from app.services.gemini_service import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_scan_telemetry(event: str, level: int, payload: dict[str, Any]) -> None:
+    """
+    Emits structured scan operational telemetry.
+    Completely isolated so that telemetry errors can NEVER interfere with or fail a scan.
+    """
+    try:
+        json_payload = json.dumps(payload, default=str)
+        logger.log(
+            level,
+            "scan_telemetry_event: %s | data=%s",
+            event,
+            json_payload,
+            extra={"telemetry": payload},
+        )
+    except Exception:
+        # If logger fails (e.g. disk full, broken stream, serialization error),
+        # silently suppress to guarantee scan execution is never failed by telemetry.
+        pass
 
 
 class ScanValidationError(ValueError):
@@ -24,6 +50,19 @@ class ScanValidationError(ValueError):
 class UnsupportedInputModeError(ScanValidationError):
     """Raised when an unsupported input mode (e.g. standalone URL or image file) is submitted."""
     pass
+
+
+class ScanServiceUnavailableError(Exception):
+    """Raised when both detection engines fail and the scan cannot be completed."""
+
+    def __init__(
+        self,
+        message: str = "Scan service is temporarily unavailable. Please retry shortly.",
+        retry_after: int = 30,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.retry_after = retry_after
 
 
 SCAM_PATTERNS: dict[str, int] = {
@@ -109,9 +148,17 @@ def find_matched_patterns(content: str) -> list[str]:
 
 
 def calculate_risk_score(content: str) -> int:
-    matched = find_matched_patterns(content)
-    score = sum(SCAM_PATTERNS[p] for p in matched)
-    return min(score, 100)
+    """
+    Backward-compatible wrapper delegating to the Phase 3 canonical detection subsystem.
+    Calculates unified deterministic rule risk score.
+    """
+    if not content or not content.strip():
+        return 0
+    try:
+        return analyze_job_posting(content).rule_score
+    except Exception:
+        logger.exception("analyze_job_posting failed in calculate_risk_score wrapper")
+        return 0
 
 
 def get_verdict(risk_score: int) -> str:
@@ -139,6 +186,37 @@ def get_verdict(risk_score: int) -> str:
         return "High Risk"
 
 
+def format_detection_indicators(evidence_items: list[EvidenceItem]) -> list[str]:
+    """
+    Formats scorable Phase 3 findings into standard list-of-strings indicators.
+    Enforces Modified Option A format:
+      f'{item.explanation} — Evidence: "{item.matched_text}"'
+    Filters out zero-weight and non-scorable findings. Preserves first-seen case
+    and maintains insertion order without duplicates.
+    """
+    seen: set[str] = set()
+    indicators: list[str] = []
+    for item in evidence_items:
+        if get_effective_weight(item) <= 0:
+            continue
+        matched = (item.matched_text or "").strip()
+        explanation = (item.explanation or "").strip()
+        if matched and explanation:
+            indicator_str = f'{explanation} — Evidence: "{matched}"'
+        elif explanation:
+            indicator_str = explanation
+        elif matched:
+            indicator_str = f'Evidence: "{matched}"'
+        else:
+            continue
+
+        key = indicator_str.lower()
+        if key not in seen:
+            seen.add(key)
+            indicators.append(indicator_str)
+    return indicators
+
+
 def _combine_indicators(
     rule_patterns: list[str], gemini_indicators: list[str]
 ) -> list[str]:
@@ -160,11 +238,12 @@ def _combine_indicators(
 
 
 def _build_rule_elevated_explanation(
-    matched_patterns: list[str],
+    detection_result: DetectionResult | None,
     rule_score: int,
     verdict: str,
     gemini_score: int,
     gemini_explanation: str,
+    matched_patterns: list[str] | None = None,
 ) -> str:
     """
     Builds an explanation acknowledging rule-based warning signs when the rule
@@ -172,55 +251,106 @@ def _build_rule_elevated_explanation(
     describes matched patterns cautiously as warning signs, and preserves
     useful context from Gemini.
     """
-    patterns_str = ", ".join(f"'{p}'" for p in matched_patterns)
-    warning_phrase = "warning sign" if len(matched_patterns) == 1 else "warning signs"
-    explanation = (
-        f"Rule-based detection identified {warning_phrase} ({patterns_str}), "
-        f"elevating the risk score to {rule_score} ({verdict}) over the contextual score of {gemini_score}. "
-        f"While detected phrases represent warning signs rather than definitive proof of fraud, they warrant caution."
-    )
-    trimmed_gemini = gemini_explanation.strip()
+    patterns: list[str] = []
+    seen_pats: set[str] = set()
+    if detection_result and detection_result.evidence_items:
+        for it in detection_result.evidence_items:
+            if get_effective_weight(it) > 0 and it.matched_text:
+                pat_str = f"'{it.matched_text}'"
+                if pat_str.lower() not in seen_pats:
+                    seen_pats.add(pat_str.lower())
+                    patterns.append(pat_str)
+    elif matched_patterns:
+        for p in matched_patterns:
+            pat_str = f"'{p}'"
+            if pat_str.lower() not in seen_pats:
+                seen_pats.add(pat_str.lower())
+                patterns.append(pat_str)
+
+    if patterns:
+        patterns_str = ", ".join(patterns)
+        warning_phrase = "warning sign" if len(patterns) == 1 else "warning signs"
+        explanation = (
+            f"Rule-based detection identified {warning_phrase} ({patterns_str}), "
+            f"elevating the risk score to {rule_score} ({verdict}) over the contextual score of {gemini_score}. "
+            f"While detected phrases represent warning signs rather than definitive proof of fraud, they warrant caution."
+        )
+    else:
+        explanation = (
+            f"Rule-based detection elevated the risk score to {rule_score} ({verdict}) "
+            f"over the contextual score of {gemini_score}. Caution is advised."
+        )
+
+    trimmed_gemini = gemini_explanation.strip() if gemini_explanation else ""
     if trimmed_gemini:
         explanation += f" Contextual analysis noted: {trimmed_gemini}"
     return explanation
 
 
 def reconcile_scan_findings(
-    content: str,
-    gemini_score: int,
-    gemini_explanation: str,
-    gemini_indicators: list[str],
+    detection_or_content: DetectionResult | str | None = None,
+    gemini_score: int = 0,
+    gemini_explanation: str = "",
+    gemini_indicators: list[str] | None = None,
+    *,
+    content: str | None = None,
+    detection_result: DetectionResult | None = None,
 ) -> tuple[int, str, str, list[str]]:
     """
-    Reconciles rule-based pattern detection with Gemini contextual analysis.
+    Reconciles deterministic detection findings with Gemini contextual analysis.
     Preserves max(rule_score, gemini_score).
     When rule_score > gemini_score, produces an explanation and indicators that
     acknowledge the matched rule-based findings without discarding Gemini's context.
-    When gemini_score >= rule_score, preserves Gemini's contextual explanation and indicators.
+    When gemini_score >= rule_score, preserves Gemini's contextual explanation and
+    combines all grounded indicators.
     Returns: (risk_score, verdict, explanation, indicators)
     """
-    matched_patterns = find_matched_patterns(content)
-    rule_score = min(sum(SCAM_PATTERNS[p] for p in matched_patterns), 100)
+    actual_detection: DetectionResult | None = detection_result
+    raw_content: str | None = content
+
+    if actual_detection is None:
+        if isinstance(detection_or_content, DetectionResult):
+            actual_detection = detection_or_content
+        elif isinstance(detection_or_content, str):
+            raw_content = detection_or_content
+
+    if actual_detection is None and raw_content:
+        try:
+            actual_detection = analyze_job_posting(raw_content)
+        except Exception:
+            logger.exception("Failed to execute analyze_job_posting in reconcile_scan_findings")
+            actual_detection = None
+
+    if actual_detection is not None:
+        rule_score = actual_detection.rule_score
+        rule_indicators = format_detection_indicators(actual_detection.evidence_items)
+    else:
+        rule_score = 0
+        rule_indicators = []
+
     risk_score = max(rule_score, gemini_score)
     verdict = get_verdict(risk_score)
+    safe_gemini_indicators = list(gemini_indicators) if gemini_indicators else []
 
     if rule_score > gemini_score:
         explanation = _build_rule_elevated_explanation(
-            matched_patterns=matched_patterns,
+            detection_result=actual_detection,
             rule_score=rule_score,
             verdict=verdict,
             gemini_score=gemini_score,
             gemini_explanation=gemini_explanation,
         )
-        indicators = _combine_indicators(matched_patterns, gemini_indicators)
+        indicators = _combine_indicators(rule_indicators, safe_gemini_indicators)
     else:
         explanation = gemini_explanation
-        indicators = _combine_indicators([], gemini_indicators)
+        indicators = _combine_indicators(rule_indicators, safe_gemini_indicators)
 
     return risk_score, verdict, explanation, indicators
 
 
 def create_scan(content: str, user_id: int, db: Session) -> Scan:
+    start_time = time.perf_counter()
+
     # Control character validation
     if any(unicodedata.category(c) == "Cc" and c not in ("\n", "\r", "\t") for c in content):
         raise ScanValidationError("Content contains invalid control characters")
@@ -254,21 +384,36 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
     if len(scannable_text) > 50000:
         raise ScanValidationError("Content exceeds maximum length of 50000 characters")
 
-    # Existing rule-based detection
-    rule_score = calculate_risk_score(scannable_text)
+    # Phase 3 Deterministic Detection Engine (synchronous, ~35ms)
+    detection_result: DetectionResult | None = None
+    phase3_failed = False
+    phase3_error: Exception | None = None
+    try:
+        detection_result = analyze_job_posting(scannable_text)
+        rule_score = detection_result.rule_score
+    except Exception as exc:
+        logger.exception("Phase 3 detection engine failed defensively; defaulting rule score to 0")
+        phase3_failed = True
+        phase3_error = exc
+        detection_result = None
+        rule_score = 0
 
     explanation: str | None = None
     indicators: list[str] | None = None
     job_details: dict[str, str | None] | None = None
     analysis_mode: str = AnalysisMode.RULES_ONLY.value
 
-    # Gemini provides contextual analysis
+    # Gemini contextual analysis
+    gemini_result: dict[str, Any] | None = None
+    gemini_failed = False
+    gemini_error: Exception | None = None
+
     try:
-        gemini_result = analyze_job_content(scannable_text)
-        if not isinstance(gemini_result, dict):
+        raw_gemini = analyze_job_content(scannable_text)
+        if not isinstance(raw_gemini, dict):
             raise ValueError("Gemini analysis returned unexpected format")
 
-        gemini_score = gemini_result.get("risk_score")
+        gemini_score = raw_gemini.get("risk_score")
         if (
             isinstance(gemini_score, bool)
             or not isinstance(gemini_score, int)
@@ -276,36 +421,104 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         ):
             raise ValueError("Gemini returned an invalid risk score")
 
-        gemini_explanation = gemini_result.get("explanation")
+        gemini_explanation = raw_gemini.get("explanation")
         if not isinstance(gemini_explanation, str):
             raise ValueError("Gemini returned an invalid explanation")
 
-        gemini_indicators = gemini_result.get("indicators")
+        gemini_indicators = raw_gemini.get("indicators")
         if (
             not isinstance(gemini_indicators, list)
             or not all(isinstance(item, str) for item in gemini_indicators)
         ):
             raise ValueError("Gemini returned invalid indicators")
 
+        gemini_result = raw_gemini
+    except Exception as exc:
+        logger.exception(
+            "Gemini analysis failed; falling back to deterministic rule scoring"
+        )
+        gemini_failed = True
+        gemini_error = exc
+
+    # Dual-engine failure protection (Option 2)
+    if phase3_failed and gemini_failed:
+        logger.critical(
+            "Both detection engines failed for scan request: Phase 3 error: %r | Gemini error: %r",
+            phase3_error,
+            gemini_error,
+        )
+        try:
+            db.rollback()
+        except Exception as rb_exc:
+            logger.error(
+                "Database rollback failed during dual-engine failure cleanup: %s",
+                rb_exc,
+            )
+        _emit_scan_telemetry(
+            event="scan_dual_engine_failure",
+            level=logging.CRITICAL,
+            payload={
+                "event": "scan_dual_engine_failure",
+                "phase3_error_type": type(phase3_error).__name__ if phase3_error else "UnknownError",
+                "gemini_error_type": type(gemini_error).__name__ if gemini_error else "UnknownError",
+                "scan_service_duration_ms": round((time.perf_counter() - start_time) * 1000),
+                "retry_after": 30,
+            },
+        )
+        raise ScanServiceUnavailableError(
+            message="Scan service is temporarily unavailable. Please retry shortly.",
+            retry_after=30,
+        )
+
+    # Post-engine orchestration: cross-engine reconciliation or rules-only fallback
+    if not gemini_failed and gemini_result is not None:
+        if phase3_failed:
+            _emit_scan_telemetry(
+                event="scan_engine_degraded",
+                level=logging.WARNING,
+                payload={
+                    "event": "scan_engine_degraded",
+                    "fallback_mode": AnalysisMode.AI_ASSISTED.value,
+                    "failed_engine": "phase3",
+                    "error_type": type(phase3_error).__name__ if phase3_error else "UnknownError",
+                    "scan_service_duration_ms": round((time.perf_counter() - start_time) * 1000),
+                },
+            )
         risk_score, verdict, explanation, indicators = reconcile_scan_findings(
-            content=scannable_text,
-            gemini_score=gemini_score,
-            gemini_explanation=gemini_explanation,
-            gemini_indicators=gemini_indicators,
+            detection_result=detection_result,
+            gemini_score=gemini_result["risk_score"],
+            gemini_explanation=gemini_result["explanation"],
+            gemini_indicators=gemini_result["indicators"],
         )
         job_details = parse_extracted_details(gemini_result.get("job_details"))
         analysis_mode = AnalysisMode.AI_ASSISTED.value
-
-    except Exception:
-        logger.exception(
-            "Gemini analysis failed; using rule-based scoring"
+    else:
+        _emit_scan_telemetry(
+            event="scan_engine_degraded",
+            level=logging.WARNING,
+            payload={
+                "event": "scan_engine_degraded",
+                "fallback_mode": AnalysisMode.RULES_ONLY.value,
+                "failed_engine": "gemini",
+                "error_type": type(gemini_error).__name__ if gemini_error else "UnknownError",
+                "scan_service_duration_ms": round((time.perf_counter() - start_time) * 1000),
+            },
         )
         risk_score = rule_score
         verdict = get_verdict(risk_score)
-        explanation = None
-        indicators = None
-        job_details = None
         analysis_mode = AnalysisMode.RULES_ONLY.value
+        job_details = None
+
+        if detection_result is not None and rule_score > 0:
+            explanation = (
+                f"{detection_result.fallback_explanation} Note: AI contextual "
+                f"analysis was unavailable; scored using deterministic rule engine."
+            )
+            rule_indicators = format_detection_indicators(detection_result.evidence_items)
+            indicators = rule_indicators if rule_indicators else None
+        else:
+            explanation = None
+            indicators = None
 
     if input_type == InputType.URL:
         if job_details is None:
@@ -331,6 +544,25 @@ def create_scan(content: str, user_id: int, db: Session) -> Scan:
         db.add(new_scan)
         db.commit()
         db.refresh(new_scan)
+        _emit_scan_telemetry(
+            event="scan_completed",
+            level=logging.INFO,
+            payload={
+                "event": "scan_completed",
+                "scan_id": new_scan.id,
+                "input_type": input_type.value,
+                "analysis_mode": analysis_mode,
+                "risk_score": risk_score,
+                "rule_score": rule_score,
+                "gemini_score": gemini_result.get("risk_score") if gemini_result else None,
+                "indicator_count": len(indicators) if indicators else 0,
+                "scan_service_duration_ms": round((time.perf_counter() - start_time) * 1000),
+                "engine_status": {
+                    "phase3": "failed" if phase3_failed else "ok",
+                    "gemini": "failed" if gemini_failed else "ok",
+                },
+            },
+        )
         return new_scan
     except Exception:
         db.rollback()

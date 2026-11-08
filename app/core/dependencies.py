@@ -51,4 +51,9 @@ def get_current_user(
     if user is None:
         raise credentials_exception
 
+    # P4.3-B: Detach loaded user so its attributes remain accessible in memory
+    db.expunge(user)
+    # Explicitly release read transaction and return connection to pool immediately
+    db.rollback()
+
     return user

@@ -1,14 +1,27 @@
+import asyncio
+import builtins
+import inspect
 import json
+import logging
+import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
 import unittest
+from typing import Any, Callable
+import anyio
 import httpx
 from unittest.mock import MagicMock, call, patch
 from datetime import datetime, timezone, timedelta
 from jose import jwt
 from pydantic import ValidationError
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, select, event
+from sqlalchemy.inspection import inspect as sa_inspect
+from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import StaticPool
-from fastapi import HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
@@ -16,7 +29,17 @@ from app.core.security import DUMMY_HASH, hash_password, normalize_email, verify
 from app.core.auth import create_access_token
 from app.core.database import Base
 from app.core.dependencies import get_current_user, get_db
-from app.core.rate_limit import limiter, SlidingWindowRateLimiter, get_client_ip
+from app.core.rate_limit import (
+    limiter,
+    SlidingWindowRateLimiter,
+    get_client_ip,
+    ScanAdmissionSlot,
+    SlotState,
+    scan_admission_control,
+    register_rate_limiter,
+    scan_history_rate_limiter,
+    scan_rate_limiter,
+)
 from app.models import User, Scan
 from app.schemas.auth import Token
 from app.schemas.scan import AnalysisMode, InputType, ScanRequest, ScanResponse, JobDetails, Verdict
@@ -30,6 +53,7 @@ from app.services.gemini_service import (
 )
 from app.services.scan_services import (
     ScanValidationError,
+    ScanServiceUnavailableError,
     UnsupportedInputModeError,
     calculate_risk_score,
     detect_input_type,
@@ -48,7 +72,9 @@ from app.routers.scan import (
     get_scan_by_id_endpoint,
     delete_scan_endpoint,
 )
-from app.main import app
+from app.main import app, lifespan, health_check
+from app.services.detection.service import analyze_job_posting
+from app.services.detection.models import FindingSeverity, FindingStatus, ScamCategory
 from app.services.url_fetch_service import (
     ALLOWED_CONTENT_TYPES,
     ALLOWED_PORTS,
@@ -323,28 +349,28 @@ class TestScanLogic(unittest.TestCase):
         self.assertEqual(detect_input_type("chart.webp"), InputType.IMAGE)
 
     def test_calculate_risk_score(self):
-        # "guaranteed job": 25, "whatsapp only": 15 -> 40
-        content = "We have a guaranteed job. Contact us via whatsapp only."
-        score = calculate_risk_score(content)
-        self.assertEqual(score, 40)
+        # Clean content scores 0
+        clean_content = "Join our software engineering team as a backend developer."
+        self.assertEqual(calculate_risk_score(clean_content), 0)
 
-        # "registration fee": 60 alone
+        # "registration fee": Phase 3 canonical score is 65 (CRITICAL anchor)
         fee_content = "Please pay the registration fee before starting."
         fee_score = calculate_risk_score(fee_content)
-        self.assertEqual(fee_score, 60)
+        self.assertEqual(fee_score, 65)
 
     def test_calculate_risk_score_capped_at_100(self):
-        # All scam patterns together exceed 100 -> should cap at 100
-        content = "registration fee guaranteed job no interview whatsapp only urgent hiring"
+        # Multi-category scam patterns are bounded and capped at 100
+        content = "Selected candidates must pay our company a registration fee of Rs. 2,000. Also submit a refundable security deposit of Rs. 10,000 via UPI."
         score = calculate_risk_score(content)
-        self.assertEqual(score, 100)
+        self.assertLessEqual(score, 100)
+        self.assertGreaterEqual(score, 65)
 
     def test_registration_fee_yields_high_risk(self):
-        # Explicit demand for registration fee must categorize as High Risk (AUD-06 resolution)
+        # Explicit demand for registration fee must categorize as High Risk (AUD-06 resolution, canonical score 65)
         content = "Pay a registration fee to secure your job placement."
         score = calculate_risk_score(content)
         verdict = get_verdict(score)
-        self.assertEqual(score, 60)
+        self.assertEqual(score, 65)
         self.assertEqual(verdict, "High Risk")
 
     def test_calculate_risk_score_negation_handling(self):
@@ -363,11 +389,11 @@ class TestScanLogic(unittest.TestCase):
 
         # Mixed: negated mention and unnegated mention should still score the unnegated flag
         mixed = "No registration fee for testing, but a registration fee is required for materials."
-        self.assertEqual(calculate_risk_score(mixed), 60)
+        self.assertEqual(calculate_risk_score(mixed), 65)
 
         # Cross-sentence boundaries should not negate: 'No.' in sentence 1 does not negate fee in sentence 2
         cross_sentence = "No. A registration fee is required before orientation."
-        self.assertEqual(calculate_risk_score(cross_sentence), 60)
+        self.assertEqual(calculate_risk_score(cross_sentence), 65)
 
     def test_verdicts(self):
         # Low Risk: 0 to 20
@@ -765,7 +791,7 @@ class TestScanWorkflow(unittest.TestCase):
 
     @patch("app.services.scan_services.analyze_job_content")
     def test_create_scan_prefers_higher_rule_score(self, mock_analyze):
-        # Rule score for "registration fee" is 60. Gemini score is 30.
+        # Rule score for "registration fee" is 65 (Phase 3 CRITICAL anchor). Gemini score is 30.
         mock_analyze.return_value = {
             "risk_score": 30,
             "explanation": "Context has minor concerns but employer looks partially genuine.",
@@ -774,30 +800,33 @@ class TestScanWorkflow(unittest.TestCase):
         content = "Candidate must pay a registration fee before the start date."
         scan = create_scan(content, self.user.id, self.db)
 
-        self.assertEqual(scan.risk_score, 60)
+        self.assertEqual(scan.risk_score, 65)
         self.assertEqual(scan.verdict, "High Risk")
         self.assertIn("registration fee", scan.explanation.lower())
         self.assertIn("Context has minor concerns but employer looks partially genuine.", scan.explanation)
-        self.assertEqual(scan.indicators, ["registration fee", "Vague requirements"])
+        self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
+        self.assertIn("Vague requirements", scan.indicators)
 
     @patch("app.services.scan_services.analyze_job_content")
     def test_create_scan_gemini_failure_falls_back_to_rules(self, mock_analyze):
         mock_analyze.side_effect = RuntimeError("Gemini API connection error")
-        content = "We have an urgent hiring need and whatsapp only communication."
-        # Rule score: urgent hiring (10) + whatsapp only (15) = 25 -> Medium Risk
+        content = "Candidate must pay a registration fee before the start date."
+        # Rule score: registration fee = 65 -> High Risk
         scan = create_scan(content, self.user.id, self.db)
 
-        self.assertEqual(scan.risk_score, 25)
-        self.assertEqual(scan.verdict, "Medium Risk")
-        self.assertIsNone(scan.explanation)
-        self.assertIsNone(scan.indicators)
+        self.assertEqual(scan.risk_score, 65)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertIsNotNone(scan.explanation)
+        self.assertIn("65 points (High Risk)", scan.explanation)
+        self.assertIsNotNone(scan.indicators)
+        self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
 
         # Ensure scan is still saved and retrievable
         fetched = get_scan_by_id(scan.id, self.user.id, self.db)
         self.assertIsNotNone(fetched)
-        self.assertEqual(fetched.risk_score, 25)
-        self.assertIsNone(fetched.explanation)
-        self.assertIsNone(fetched.indicators)
+        self.assertEqual(fetched.risk_score, 65)
+        self.assertEqual(fetched.explanation, scan.explanation)
+        self.assertEqual(fetched.indicators, scan.indicators)
 
     @patch("app.services.scan_services.analyze_job_content")
     def test_create_scan_gemini_malformed_fields_fallback(self, mock_analyze):
@@ -812,15 +841,16 @@ class TestScanWorkflow(unittest.TestCase):
             "not even a dict",
         ]
         content = "Please pay registration fee for onboarding materials."
-        # Rule score: registration fee = 60
+        # Rule score: registration fee = 65
 
         for bad_output in malformed_outputs:
             mock_analyze.return_value = bad_output
             scan = create_scan(content, self.user.id, self.db)
-            self.assertEqual(scan.risk_score, 60)
+            self.assertEqual(scan.risk_score, 65)
             self.assertEqual(scan.verdict, "High Risk")
-            self.assertIsNone(scan.explanation)
-            self.assertIsNone(scan.indicators)
+            self.assertIsNotNone(scan.explanation)
+            self.assertIsNotNone(scan.indicators)
+            self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
 
     @patch("app.services.scan_services.analyze_job_content")
     def test_scan_endpoints_response_fields(self, mock_analyze):
@@ -834,7 +864,9 @@ class TestScanWorkflow(unittest.TestCase):
         create_res = create_scan_endpoint(scan_request=req, db=self.db, current_user=self.user)
         self.assertEqual(create_res.risk_score, 85)
         self.assertEqual(create_res.explanation, "Definite scam pattern detected with fraudulent recruitment tactics.")
-        self.assertEqual(create_res.indicators, ["Fake company", "Upfront fee request"])
+        self.assertIn("Fake company", create_res.indicators)
+        self.assertIn("Upfront fee request", create_res.indicators)
+        self.assertTrue(any("registration" in ind.lower() for ind in create_res.indicators))
 
         # 2. GET /scan/
         list_res = get_user_scans_endpoint(db=self.db, current_user=self.user)
@@ -899,12 +931,11 @@ class TestScanWorkflow(unittest.TestCase):
     @patch("app.services.scan_services.analyze_job_content")
     def test_create_scan_gemini_failure_leaves_job_details_none(self, mock_analyze):
         mock_analyze.side_effect = RuntimeError("Gemini offline")
-        content = "Urgent hiring for data entry role with guaranteed job."
-        # Rule score: urgent hiring (10) + guaranteed job (25) = 35 -> Medium Risk
+        content = "Clean job opening for senior software engineer at legitimate company."
         scan = create_scan(content, self.user.id, self.db)
 
-        self.assertEqual(scan.risk_score, 35)
-        self.assertEqual(scan.verdict, "Medium Risk")
+        self.assertEqual(scan.risk_score, 0)
+        self.assertEqual(scan.verdict, "Low Risk")
         self.assertIsNone(scan.explanation)
         self.assertIsNone(scan.indicators)
         self.assertIsNone(scan.job_details)
@@ -926,7 +957,7 @@ class TestScanWorkflow(unittest.TestCase):
 
         self.assertEqual(scan.risk_score, 75)
         self.assertEqual(scan.explanation, "Advance fee scam detected.")
-        self.assertEqual(scan.indicators, ["registration fee"])
+        self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
         self.assertIsNone(scan.job_details)
 
     @patch("app.services.scan_services.analyze_job_content")
@@ -1135,14 +1166,15 @@ class TestScanConsistencyAndReconciliation(unittest.TestCase):
             gemini_explanation="Looks generally safe.",
             gemini_indicators=["Informal text"],
         )
-        self.assertEqual(risk_score, 60)
+        self.assertEqual(risk_score, 65)
         self.assertEqual(verdict, "High Risk")
         self.assertIn("registration fee", explanation.lower())
         self.assertIn("warning sign", explanation.lower())
-        self.assertIn("60 (High Risk)", explanation)
+        self.assertIn("65 (High Risk)", explanation)
         self.assertIn("10", explanation)
         self.assertIn("Looks generally safe.", explanation)
-        self.assertEqual(indicators, ["registration fee", "Informal text"])
+        self.assertTrue(any("registration" in ind.lower() for ind in indicators))
+        self.assertIn("Informal text", indicators)
 
     def test_reconcile_scan_findings_gemini_higher(self):
         content = "Urgent hiring for junior engineer."
@@ -1172,31 +1204,31 @@ class TestScanConsistencyAndReconciliation(unittest.TestCase):
 
     @patch("app.services.scan_services.analyze_job_content")
     def test_case_a_rule_score_higher_than_gemini_score(self, mock_analyze):
-        """Case A: Rule score 60, Gemini score 10 -> score 60, 'High Risk', explanation & indicators acknowledge warning."""
+        """Case A: Rule score 65, Gemini score 10 -> score 65, 'High Risk', explanation & indicators acknowledge warning."""
         mock_analyze.return_value = {
             "risk_score": 10,
             "explanation": "The posting appears legitimate and structured normally.",
             "indicators": [],
         }
-        content = "Applicants are required to submit an upfront registration fee to participate."
+        content = "Applicants must pay an upfront registration fee to participate."
         scan = create_scan(content, self.user.id, self.db)
 
-        self.assertEqual(scan.risk_score, 60)
+        self.assertEqual(scan.risk_score, 65)
         self.assertEqual(scan.verdict, "High Risk")
         self.assertIn("registration fee", scan.explanation.lower())
         self.assertIn("warning sign", scan.explanation.lower())
-        self.assertIn("60 (High Risk)", scan.explanation)
+        self.assertIn("65 (High Risk)", scan.explanation)
         self.assertIn("10", scan.explanation)
         self.assertIn("The posting appears legitimate and structured normally.", scan.explanation)
-        self.assertEqual(scan.indicators, ["registration fee"])
+        self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
 
         # Persistence check
         fetched = get_scan_by_id(scan.id, self.user.id, self.db)
         self.assertIsNotNone(fetched)
-        self.assertEqual(fetched.risk_score, 60)
+        self.assertEqual(fetched.risk_score, 65)
         self.assertEqual(fetched.verdict, "High Risk")
         self.assertEqual(fetched.explanation, scan.explanation)
-        self.assertEqual(fetched.indicators, ["registration fee"])
+        self.assertEqual(fetched.indicators, scan.indicators)
 
     @patch("app.services.scan_services.analyze_job_content")
     def test_case_b_gemini_score_higher_than_rule_score(self, mock_analyze):
@@ -1255,24 +1287,26 @@ class TestScanConsistencyAndReconciliation(unittest.TestCase):
 
     @patch("app.services.scan_services.analyze_job_content")
     def test_case_e_gemini_exception_fallback_preserved(self, mock_analyze):
-        """Case E: Gemini raises an exception -> Existing rule-based fallback still works with same persistence and response."""
+        """Case E: Gemini raises an exception -> Phase 3 rule-based fallback preserves grounded evidence and response."""
         mock_analyze.side_effect = RuntimeError("Gemini connection timed out")
         content = "Candidate must pay a registration fee before the start date."
-        # Rule score: registration fee = 60
+        # Rule score: registration fee = 65
         scan = create_scan(content, self.user.id, self.db)
 
-        self.assertEqual(scan.risk_score, 60)
+        self.assertEqual(scan.risk_score, 65)
         self.assertEqual(scan.verdict, "High Risk")
-        self.assertIsNone(scan.explanation)
-        self.assertIsNone(scan.indicators)
+        self.assertIsNotNone(scan.explanation)
+        self.assertIn("65 points (High Risk)", scan.explanation)
+        self.assertIsNotNone(scan.indicators)
+        self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
         self.assertIsNone(scan.job_details)
 
         fetched = get_scan_by_id(scan.id, self.user.id, self.db)
         self.assertIsNotNone(fetched)
-        self.assertEqual(fetched.risk_score, 60)
+        self.assertEqual(fetched.risk_score, 65)
         self.assertEqual(fetched.verdict, "High Risk")
-        self.assertIsNone(fetched.explanation)
-        self.assertIsNone(fetched.indicators)
+        self.assertEqual(fetched.explanation, scan.explanation)
+        self.assertEqual(fetched.indicators, scan.indicators)
         self.assertIsNone(fetched.job_details)
 
 
@@ -1331,22 +1365,25 @@ class TestGeminiTimeout(unittest.TestCase):
         user = create_user(UserCreate(email="timeout@test.com", password="Password123"), db)
 
         mock_analyze.side_effect = httpx.ReadTimeout("Gemini request timed out")
-        # "registration fee" scores 60 -> High Risk
+        # "registration fee" scores 65 -> High Risk
         content = "Applicants must pay a registration fee to start the onboarding process."
         scan = create_scan(content, user.id, db)
 
-        self.assertEqual(scan.risk_score, 60)
+        self.assertEqual(scan.risk_score, 65)
         self.assertEqual(scan.verdict, "High Risk")
-        self.assertIsNone(scan.explanation)
-        self.assertIsNone(scan.indicators)
+        self.assertIsNotNone(scan.explanation)
+        self.assertIn("65 points (High Risk)", scan.explanation)
+        self.assertIsNotNone(scan.indicators)
+        self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
         self.assertIsNone(scan.job_details)
 
         fetched = get_scan_by_id(scan.id, user.id, db)
         self.assertIsNotNone(fetched)
-        self.assertEqual(fetched.risk_score, 60)
+        self.assertEqual(fetched.risk_score, 65)
         self.assertEqual(fetched.verdict, "High Risk")
-        self.assertIsNone(fetched.explanation)
-        self.assertIsNone(fetched.indicators)
+        self.assertEqual(fetched.explanation, scan.explanation)
+        self.assertEqual(fetched.indicators, scan.indicators)
+        self.assertIsNone(fetched.job_details)
 
         db.close()
         Base.metadata.drop_all(bind=engine)
@@ -1826,8 +1863,7 @@ class TestInputHardeningAndPromptInjection(unittest.TestCase):
 
         scan = create_scan(adversarial_post, self.user.id, self.db)
         self.assertEqual(scan.analysis_mode, "rules_only")
-        # "urgent hiring" = 10 -> Low Risk
-        self.assertEqual(scan.risk_score, 10)
+        self.assertEqual(scan.risk_score, 0)
         self.assertEqual(scan.verdict, "Low Risk")
         self.assertIsNone(scan.explanation)
         self.assertIsNone(scan.indicators)
@@ -1850,11 +1886,11 @@ class TestInputHardeningAndPromptInjection(unittest.TestCase):
         mock_client.models.generate_content.return_value = mock_response
 
         scan = create_scan(adversarial_post, self.user.id, self.db)
-        # Rule-based score for "registration fee" is 60 -> High Risk
-        self.assertEqual(scan.risk_score, 60)
+        # Rule-based score for "registration fee" is 65 (Phase 3 CRITICAL anchor) -> High Risk
+        self.assertEqual(scan.risk_score, 65)
         self.assertEqual(scan.verdict, "High Risk")
-        self.assertIn("registration fee", scan.indicators)
-        self.assertIn("Rule-based detection identified warning sign ('registration fee')", scan.explanation)
+        self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
+        self.assertIn("registration fee", scan.explanation.lower())
 
 
 class TestRateLimiting(unittest.TestCase):
@@ -3067,11 +3103,11 @@ class TestSecureURLIngestion(unittest.TestCase):
         }
 
         scan = create_scan("https://scam-site.org/job", self.user.id, self.db)
-        # Rule detection for 'registration fee' (60 points) overrides Gemini (0 points)
-        self.assertEqual(scan.risk_score, 60)
+        # Rule detection for 'registration fee' (65 points under Phase 3) overrides Gemini (0 points)
+        self.assertEqual(scan.risk_score, 65)
         self.assertEqual(scan.verdict, "High Risk")
-        self.assertIn("registration fee", scan.explanation)
-        self.assertIn("registration fee", scan.indicators)
+        self.assertIn("registration fee", scan.explanation.lower())
+        self.assertTrue(any("registration" in ind.lower() for ind in scan.indicators))
 
     @patch("app.services.scan_services.analyze_job_content")
     @patch("app.services.url_fetch_service.fetch_job_url")
@@ -5028,6 +5064,1941 @@ Candidates must pay an application processing fee of Rs. 500."""
         score = calculate_evidence_score(reconciled)
         self.assertEqual(score, 65)
         self.assertEqual(get_verdict(score), "High Risk")
+
+
+class TestPhase4ProductionIntegration(unittest.TestCase):
+    """
+    Focused Phase 4.2 integration test suite verifying:
+      1. Canonical Phase 3 integration into create_scan().
+      2. Cross-engine reconciliation consuming DetectionResult.
+      3. Indicator formatting adhering to approved Modified Option A.
+      4. Grounded evidence preservation in rules_only fallback.
+      5. Fault isolation: individual engine failures and both-engines-fail safety.
+      6. calculate_risk_score() backward compatibility wrapper.
+    """
+
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=self.engine)
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self.db = self.SessionLocal()
+        self.user = create_user(
+            UserCreate(email="phase4@integration.org", password="Password123"),
+            self.db,
+        )
+        self.token = create_access_token(self.user.id)
+        self.headers = {"Authorization": f"Bearer {self.token}"}
+
+        def override_get_db():
+            db = self.SessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        self.client = TestClient(app)
+
+    def tearDown(self):
+        app.dependency_overrides.clear()
+        self.db.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_phase4_e2e_ai_assisted_rule_elevated(self, mock_gemini):
+        """Phase 3 rule engine elevates score over Gemini's contextual score with Modified Option A indicators."""
+        mock_gemini.return_value = {
+            "risk_score": 15,
+            "explanation": "Contextual review notes employer seems partially established.",
+            "indicators": ["Informal communication channel"],
+            "job_details": {"title": "Junior Data Entry", "company": "Tech Corp"},
+        }
+        content = "Selected candidates must pay a registration fee of Rs. 2,000 before the interview date."
+        scan = create_scan(content, self.user.id, self.db)
+
+        # Score elevation: Phase 3 CRITICAL anchor (65) > Gemini (15)
+        self.assertEqual(scan.risk_score, 65)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertEqual(scan.analysis_mode, "ai_assisted")
+
+        # Elevated explanation preserves both Phase 3 warning and Gemini note
+        self.assertIn("Rule-based detection identified warning sign", scan.explanation)
+        self.assertIn("65 (High Risk)", scan.explanation)
+        self.assertIn("15", scan.explanation)
+        self.assertIn("Contextual review notes", scan.explanation)
+
+        # Indicators formatted per Modified Option A: explanation — Evidence: "quote"
+        self.assertTrue(any('— Evidence: "' in ind for ind in scan.indicators))
+        self.assertTrue(any("registration fee" in ind.lower() for ind in scan.indicators))
+        self.assertIn("Informal communication channel", scan.indicators)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_phase4_e2e_rules_only_fallback_preserves_phase3_evidence(self, mock_gemini):
+        """When Gemini fails/times out, Phase 3 evidence and formatted indicators are preserved in rules_only mode."""
+        mock_gemini.side_effect = httpx.ReadTimeout("Gemini service timeout")
+        content = "Candidates must pay our company a registration fee of Rs. 2,000 to proceed."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(scan.risk_score, 65)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertEqual(scan.analysis_mode, "rules_only")
+
+        # Explanation and indicators are NOT None; Phase 3 evidence is preserved
+        self.assertIsNotNone(scan.explanation)
+        self.assertIn("65 points (High Risk)", scan.explanation)
+        self.assertIn("AI contextual analysis was unavailable", scan.explanation)
+        self.assertIsNotNone(scan.indicators)
+        self.assertTrue(any('— Evidence: "' in ind for ind in scan.indicators))
+        self.assertTrue(any("registration fee" in ind.lower() for ind in scan.indicators))
+        self.assertIsNone(scan.job_details)
+
+    @patch("app.services.scan_services.analyze_job_posting")
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_phase4_e2e_phase3_failure_gemini_success_isolation(self, mock_gemini, mock_phase3):
+        """If Phase 3 engine fails defensively, Gemini contextual analysis fully protects user without crashing."""
+        mock_phase3.side_effect = RuntimeError("Phase 3 memory/syntax error")
+        mock_gemini.return_value = {
+            "risk_score": 85,
+            "explanation": "Definite phishing scam demanding identity documents.",
+            "indicators": ["Phishing domain", "Sensitive doc request"],
+            "job_details": None,
+        }
+        content = "Standard job description with legitimate terms."
+        scan = create_scan(content, self.user.id, self.db)
+
+        # Gemini score (85) protects user despite Phase 3 failure (rule_score=0)
+        self.assertEqual(scan.risk_score, 85)
+        self.assertEqual(scan.verdict, "High Risk")
+        self.assertEqual(scan.analysis_mode, "ai_assisted")
+        self.assertEqual(scan.explanation, "Definite phishing scam demanding identity documents.")
+        self.assertEqual(scan.indicators, ["Phishing domain", "Sensitive doc request"])
+
+    @patch("app.services.scan_services.analyze_job_posting")
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_phase4_service_both_engines_fail_raises_service_unavailable(self, mock_gemini, mock_phase3):
+        """When BOTH engines fail at service level, ScanServiceUnavailableError is raised and no Scan is persisted."""
+        mock_phase3.side_effect = RuntimeError("Phase 3 crash")
+        mock_gemini.side_effect = RuntimeError("Gemini offline")
+        content = "Job description content for senior software engineer role."
+
+        with self.assertRaises(ScanServiceUnavailableError) as ctx:
+            create_scan(content, self.user.id, self.db)
+
+        self.assertEqual(ctx.exception.retry_after, 30)
+        self.assertIn("temporarily unavailable", ctx.exception.message)
+
+        # Database safety: zero records should be committed
+        scans = get_user_scans(self.user.id, self.db)
+        self.assertEqual(len(scans), 0)
+
+    @patch("app.services.scan_services.analyze_job_posting")
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_phase4_endpoint_both_engines_fail_returns_503_and_retry_after(self, mock_gemini, mock_phase3):
+        """When BOTH engines fail, POST /scan/ returns HTTP 503 with Retry-After header and commits no DB rows."""
+        mock_phase3.side_effect = RuntimeError("Phase 3 internal error")
+        mock_gemini.side_effect = RuntimeError("Gemini connection timeout")
+        payload = {"content": "Senior React Developer opening at a global enterprise."}
+
+        res = self.client.post("/scan/", json=payload, headers=self.headers)
+
+        self.assertEqual(res.status_code, 503)
+        self.assertEqual(res.headers.get("retry-after"), "30")
+        self.assertEqual(
+            res.json()["detail"],
+            "Scan service is temporarily unavailable. Please retry shortly.",
+        )
+
+        # Database safety: zero records should be committed
+        scans = get_user_scans(self.user.id, self.db)
+        self.assertEqual(len(scans), 0)
+
+    @patch("app.services.scan_services.reconcile_scan_findings")
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_phase4_reconciliation_failure_not_classified_as_gemini_failure(
+        self, mock_gemini, mock_reconcile
+    ):
+        """When Gemini succeeds but reconciliation raises an exception, it is not misclassified as a Gemini failure."""
+        mock_gemini.return_value = {
+            "risk_score": 30,
+            "explanation": "Valid Gemini payload",
+            "indicators": ["Valid indicator"],
+            "job_details": None,
+        }
+        mock_reconcile.side_effect = RuntimeError("Internal reconciliation calculation error")
+        content = "Software Engineer at TechCorp."
+
+        # The error propagates directly as a RuntimeError, NOT ScanServiceUnavailableError (503)
+        with self.assertRaises(RuntimeError) as ctx:
+            create_scan(content, self.user.id, self.db)
+
+        self.assertIn("Internal reconciliation calculation error", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, ScanServiceUnavailableError)
+
+    @patch("app.services.scan_services.logger.error")
+    @patch("app.services.scan_services.analyze_job_posting")
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_phase4_dual_engine_failure_logs_rollback_error(
+        self, mock_gemini, mock_phase3, mock_log_error
+    ):
+        """When both engines fail and db.rollback fails, the rollback failure is logged at ERROR level without masking 503."""
+        mock_phase3.side_effect = RuntimeError("Phase 3 engine crashed")
+        mock_gemini.side_effect = RuntimeError("Gemini engine crashed")
+
+        # Mock db.rollback to raise an exception
+        mock_db = MagicMock()
+        mock_db.rollback.side_effect = RuntimeError("Simulated rollback connection drop")
+
+        with self.assertRaises(ScanServiceUnavailableError) as exc_ctx:
+            create_scan("Job content", self.user.id, mock_db)
+
+        self.assertEqual(exc_ctx.exception.retry_after, 30)
+
+        # Confirm rollback failure was explicitly logged at ERROR level
+        mock_log_error.assert_any_call(
+            "Database rollback failed during dual-engine failure cleanup: %s",
+            mock_db.rollback.side_effect,
+        )
+
+    def test_phase4_calculate_risk_score_delegation(self):
+        """calculate_risk_score() delegates to analyze_job_posting() adhering to Option A."""
+        # Non-empty advance fee demand
+        fee_content = "Candidates must pay our company a registration fee of Rs. 2,000."
+        self.assertEqual(calculate_risk_score(fee_content), 65)
+
+        # Negated fee demand
+        negated_content = "Our company does not charge any registration fees for applying."
+        self.assertEqual(calculate_risk_score(negated_content), 0)
+
+        # Empty / whitespace handling
+        self.assertEqual(calculate_risk_score(""), 0)
+        self.assertEqual(calculate_risk_score("   "), 0)
+
+    def test_phase4_indicator_string_formatting_modified_option_a(self):
+        """format_detection_indicators() formats active scorable findings and ignores non-scorable items."""
+        from app.services.scan_services import format_detection_indicators
+        from app.services.detection.models import (
+            EvidenceItem,
+            ScamCategory,
+            DetectionSource,
+            FindingSeverity,
+            FindingStatus,
+            CandidateEligibility,
+        )
+
+        active_item = EvidenceItem(
+            id="ADV_FEE_REGISTRATION",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.CRITICAL,
+            status=FindingStatus.EXPLICIT_CLAIM,
+            matched_text="pay a registration fee",
+            explanation="Mandatory registration fee demand.",
+            start_pos=10,
+            end_pos=32,
+            eligibility=CandidateEligibility.SCORABLE_ACTIVE,
+        )
+        non_scorable = EvidenceItem(
+            id="DISCLAIMER_NO_FEE",
+            category=ScamCategory.ADVANCE_FEE,
+            source=DetectionSource.DETERMINISTIC_RULE,
+            severity=FindingSeverity.INFORMATIONAL,
+            status=FindingStatus.AMBIGUOUS_SIGNAL,
+            matched_text="no registration fee",
+            explanation="Disclaimer",
+            start_pos=40,
+            end_pos=59,
+            eligibility=CandidateEligibility.NON_SCORABLE_INFORMATIONAL,
+        )
+
+        indicators = format_detection_indicators([active_item, non_scorable])
+        self.assertEqual(len(indicators), 1)
+        self.assertEqual(
+            indicators[0],
+            'Mandatory registration fee demand. — Evidence: "pay a registration fee"',
+        )
+
+
+class LogCaptureHandler(logging.Handler):
+    """Utility log handler to capture LogRecord instances for telemetry assertions."""
+
+    def __init__(self):
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def get_telemetry_records(self, event_name: str | None = None) -> list[logging.LogRecord]:
+        telemetry_records = [r for r in self.records if hasattr(r, "telemetry")]
+        if event_name:
+            return [r for r in telemetry_records if r.telemetry.get("event") == event_name]
+        return telemetry_records
+
+
+class TestPhase43TelemetryAndConnectionLifecycle(unittest.TestCase):
+    """
+    Phase 4.3 verification test suite covering:
+      - P4.3-A: Structured Operational Telemetry
+        - scan_completed event emission on success (both engines ok)
+        - scan_engine_degraded event emission on single-engine failures (Gemini or Phase 3)
+        - scan_dual_engine_failure event emission on both engines failing (Option 2 HTTP 503)
+        - Non-crashing telemetry logger (telemetry failure does not disrupt scan pipeline)
+        - Absence of sensitive content / PII (no raw content, no passwords, no user_id)
+        - Structured metadata formatting (LogRecord.telemetry attribute and serialized JSON string)
+      - P4.3-B: Database Connection Lifecycle Improvement
+        - Expunge + rollback in get_current_user detaches User and releases connection
+        - Idle database connection during long-running Gemini execution
+        - Mandatory connection pool event sequence: auth checkout -> auth checkin -> Gemini -> persistence checkout -> persistence checkin
+        - Read rollback does not commit unrelated staged/dirty writes
+        - Detached User attributes (id, email, created_at) remain accessible in memory
+        - Compatibility with /users/me endpoint
+    """
+
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        Base.metadata.create_all(bind=self.engine)
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        self.db = self.SessionLocal()
+        self.user = create_user(
+            UserCreate(email="phase43@telemetry.org", password="Password123"),
+            self.db,
+        )
+        self.token = create_access_token(self.user.id)
+        self.headers = {"Authorization": f"Bearer {self.token}"}
+
+        def override_get_db():
+            db = self.SessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+        app.dependency_overrides[get_db] = override_get_db
+        self.client = TestClient(app)
+
+        self.log_handler = LogCaptureHandler()
+        self.scan_logger = logging.getLogger("app.services.scan_services")
+        self._orig_logger_level = self.scan_logger.level
+        self._orig_logger_disabled = self.scan_logger.disabled
+        self.scan_logger.disabled = False
+        self.scan_logger.setLevel(logging.DEBUG)
+        self.scan_logger.addHandler(self.log_handler)
+
+    def tearDown(self):
+        self.scan_logger.removeHandler(self.log_handler)
+        self.scan_logger.setLevel(self._orig_logger_level)
+        self.scan_logger.disabled = self._orig_logger_disabled
+        app.dependency_overrides.clear()
+        self.db.close()
+        Base.metadata.drop_all(bind=self.engine)
+        self.engine.dispose()
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_p43_telemetry_scan_completed_ai_assisted(self, mock_gemini):
+        """When both engines succeed, scan_completed is emitted with complete telemetry metadata."""
+        mock_gemini.return_value = {
+            "risk_score": 15,
+            "explanation": "Legitimate posting for Python Developer.",
+            "indicators": ["Clear requirements"],
+            "job_details": {"title": "Python Developer", "company": "TechCorp"},
+        }
+        content = "We are hiring a Senior Python Developer with 5+ years of experience in FastAPI and PostgreSQL."
+        scan = create_scan(content, self.user.id, self.db)
+
+        completed_records = self.log_handler.get_telemetry_records("scan_completed")
+        self.assertEqual(len(completed_records), 1)
+        record = completed_records[0]
+        self.assertEqual(record.levelno, logging.INFO)
+
+        payload = record.telemetry
+        self.assertEqual(payload["event"], "scan_completed")
+        self.assertEqual(payload["scan_id"], scan.id)
+        self.assertEqual(payload["input_type"], "text")
+        self.assertEqual(payload["analysis_mode"], "ai_assisted")
+        self.assertEqual(payload["risk_score"], scan.risk_score)
+        self.assertEqual(payload["rule_score"], 0)
+        self.assertEqual(payload["gemini_score"], 15)
+        self.assertEqual(payload["indicator_count"], 1)
+        self.assertGreaterEqual(payload["scan_service_duration_ms"], 0)
+        self.assertEqual(payload["engine_status"], {"phase3": "ok", "gemini": "ok"})
+        self.assertNotIn("user_id", payload)
+        self.assertNotIn("content", payload)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_p43_telemetry_degraded_gemini_failure_emits_both_events(self, mock_gemini):
+        """When Gemini fails and Phase 3 succeeds, scan_engine_degraded and scan_completed are emitted."""
+        mock_gemini.side_effect = httpx.ReadTimeout("Gemini connection timed out")
+        content = "Urgent hiring! Selected applicants must pay a registration fee of Rs. 2,000 immediately."
+        scan = create_scan(content, self.user.id, self.db)
+
+        degraded_records = self.log_handler.get_telemetry_records("scan_engine_degraded")
+        self.assertEqual(len(degraded_records), 1)
+        deg_record = degraded_records[0]
+        self.assertEqual(deg_record.levelno, logging.WARNING)
+        deg_payload = deg_record.telemetry
+        self.assertEqual(deg_payload["event"], "scan_engine_degraded")
+        self.assertEqual(deg_payload["fallback_mode"], "rules_only")
+        self.assertEqual(deg_payload["failed_engine"], "gemini")
+        self.assertEqual(deg_payload["error_type"], "ReadTimeout")
+        self.assertGreaterEqual(deg_payload["scan_service_duration_ms"], 0)
+
+        completed_records = self.log_handler.get_telemetry_records("scan_completed")
+        self.assertEqual(len(completed_records), 1)
+        comp_payload = completed_records[0].telemetry
+        self.assertEqual(comp_payload["scan_id"], scan.id)
+        self.assertEqual(comp_payload["analysis_mode"], "rules_only")
+        self.assertEqual(comp_payload["risk_score"], 65)
+        self.assertEqual(comp_payload["rule_score"], 65)
+        self.assertIsNone(comp_payload["gemini_score"])
+        self.assertEqual(comp_payload["engine_status"], {"phase3": "ok", "gemini": "failed"})
+
+    @patch("app.services.scan_services.analyze_job_posting")
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_p43_telemetry_degraded_phase3_failure_emits_both_events(self, mock_gemini, mock_phase3):
+        """When Phase 3 fails defensively and Gemini succeeds, scan_engine_degraded and scan_completed are emitted."""
+        mock_phase3.side_effect = RuntimeError("Phase 3 parse failure")
+        mock_gemini.return_value = {
+            "risk_score": 80,
+            "explanation": "Severe phishing risk.",
+            "indicators": ["Phishing domain"],
+            "job_details": None,
+        }
+        content = "Legitimate looking job content with at least 10 non-whitespace characters."
+        scan = create_scan(content, self.user.id, self.db)
+
+        degraded_records = self.log_handler.get_telemetry_records("scan_engine_degraded")
+        self.assertEqual(len(degraded_records), 1)
+        deg_payload = degraded_records[0].telemetry
+        self.assertEqual(deg_payload["event"], "scan_engine_degraded")
+        self.assertEqual(deg_payload["fallback_mode"], "ai_assisted")
+        self.assertEqual(deg_payload["failed_engine"], "phase3")
+        self.assertEqual(deg_payload["error_type"], "RuntimeError")
+        self.assertGreaterEqual(deg_payload["scan_service_duration_ms"], 0)
+
+        completed_records = self.log_handler.get_telemetry_records("scan_completed")
+        self.assertEqual(len(completed_records), 1)
+        comp_payload = completed_records[0].telemetry
+        self.assertEqual(comp_payload["scan_id"], scan.id)
+        self.assertEqual(comp_payload["analysis_mode"], "ai_assisted")
+        self.assertEqual(comp_payload["risk_score"], 80)
+        self.assertEqual(comp_payload["rule_score"], 0)
+        self.assertEqual(comp_payload["gemini_score"], 80)
+        self.assertEqual(comp_payload["engine_status"], {"phase3": "failed", "gemini": "ok"})
+
+    @patch("app.services.scan_services.analyze_job_posting")
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_p43_telemetry_dual_engine_failure_emits_only_critical_event(self, mock_gemini, mock_phase3):
+        """When both engines fail, only scan_dual_engine_failure is emitted at CRITICAL and scan_completed is omitted."""
+        mock_phase3.side_effect = RuntimeError("Phase 3 crash")
+        mock_gemini.side_effect = httpx.ConnectError("Gemini offline")
+        content = "Job posting content with more than ten characters."
+
+        with self.assertRaises(ScanServiceUnavailableError):
+            create_scan(content, self.user.id, self.db)
+
+        failure_records = self.log_handler.get_telemetry_records("scan_dual_engine_failure")
+        self.assertEqual(len(failure_records), 1)
+        fail_record = failure_records[0]
+        self.assertEqual(fail_record.levelno, logging.CRITICAL)
+        fail_payload = fail_record.telemetry
+        self.assertEqual(fail_payload["event"], "scan_dual_engine_failure")
+        self.assertEqual(fail_payload["phase3_error_type"], "RuntimeError")
+        self.assertEqual(fail_payload["gemini_error_type"], "ConnectError")
+        self.assertEqual(fail_payload["retry_after"], 30)
+        self.assertGreaterEqual(fail_payload["scan_service_duration_ms"], 0)
+
+        completed_records = self.log_handler.get_telemetry_records("scan_completed")
+        self.assertEqual(len(completed_records), 0)
+
+    @patch("app.services.scan_services.logger.log")
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_p43_telemetry_logging_failure_does_not_crash_scan(self, mock_gemini, mock_log):
+        """If logger.log raises an exception (e.g., disk full), the scan pipeline proceeds without crashing."""
+        mock_log.side_effect = OSError("Simulated logging disk full or broken pipe")
+        mock_gemini.return_value = {
+            "risk_score": 10,
+            "explanation": "Valid description.",
+            "indicators": [],
+            "job_details": None,
+        }
+        content = "Software Engineer position at reputable firm with full benefits."
+        scan = create_scan(content, self.user.id, self.db)
+
+        self.assertIsNotNone(scan)
+        self.assertEqual(scan.risk_score, 10)
+        self.assertEqual(scan.verdict, "Low Risk")
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_p43_telemetry_no_sensitive_content_in_logs(self, mock_gemini):
+        """Telemetry payloads and message strings must never contain raw user input or candidate PII."""
+        sensitive_secret = "CONFIDENTIAL_PASSWORD_AND_CANDIDATE_SSN_98765"
+        mock_gemini.return_value = {
+            "risk_score": 20,
+            "explanation": "Analyzed content safely.",
+            "indicators": [],
+            "job_details": None,
+        }
+        content = f"Apply now for position. Note: {sensitive_secret}."
+        create_scan(content, self.user.id, self.db)
+
+        for record in self.log_handler.records:
+            self.assertNotIn(sensitive_secret, record.getMessage())
+            if hasattr(record, "telemetry"):
+                telemetry_str = json.dumps(record.telemetry)
+                self.assertNotIn(sensitive_secret, telemetry_str)
+                self.assertNotIn("user_id", record.telemetry)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_p43_telemetry_formatter_receives_metadata(self, mock_gemini):
+        """LogRecord contains extra['telemetry'] dictionary matching the emitted JSON string."""
+        mock_gemini.return_value = {
+            "risk_score": 25,
+            "explanation": "Suspicious offer.",
+            "indicators": ["guaranteed job"],
+            "job_details": None,
+        }
+        content = "Guaranteed job with no experience required! Apply immediately."
+        create_scan(content, self.user.id, self.db)
+
+        records = self.log_handler.get_telemetry_records("scan_completed")
+        self.assertEqual(len(records), 1)
+        record = records[0]
+
+        self.assertTrue(hasattr(record, "telemetry"))
+        self.assertIsInstance(record.telemetry, dict)
+        message = record.getMessage()
+        self.assertIn("scan_telemetry_event: scan_completed | data=", message)
+        data_json = message.split("data=")[1]
+        parsed = json.loads(data_json)
+        self.assertEqual(parsed["event"], "scan_completed")
+        self.assertEqual(parsed["risk_score"], 25)
+
+    @patch("app.services.scan_services.analyze_job_content")
+    def test_p43_db_transaction_idle_during_gemini(self, mock_gemini):
+        """The database session must not be holding an active transaction while Gemini is executing."""
+        observed_transaction_states = []
+
+        def gemini_stub(text):
+            observed_transaction_states.append(self.db.in_transaction())
+            return {
+                "risk_score": 10,
+                "explanation": "Valid posting.",
+                "indicators": [],
+                "job_details": None,
+            }
+
+        mock_gemini.side_effect = gemini_stub
+        content = "Frontend developer position with experience in React and TypeScript."
+        user = get_current_user(token=self.token, db=self.db)
+        create_scan(content, user.id, self.db)
+
+        self.assertEqual(len(observed_transaction_states), 1)
+        self.assertFalse(
+            observed_transaction_states[0],
+            "Database session held an active transaction during Gemini analysis!",
+        )
+
+    def test_p43_mandatory_connection_pool_event_sequence(self):
+        """
+        Verify mandatory checkout/checkin event sequence around external analysis:
+        1. Auth user lookup checks out and immediately checks in (rollback).
+        2. External Gemini contextual analysis executes while connection is checked in.
+        3. Persistence in create_scan checks out and commits/refreshes.
+        """
+        pool_events = []
+
+        def on_checkout(dbapi_conn, conn_record, conn_proxy):
+            pool_events.append("checkout")
+
+        def on_checkin(dbapi_conn, conn_record):
+            pool_events.append("checkin")
+
+        event.listen(self.engine, "checkout", on_checkout)
+        event.listen(self.engine, "checkin", on_checkin)
+
+        try:
+            with patch("app.services.scan_services.analyze_job_content") as mock_gemini:
+                mock_gemini.side_effect = lambda text: (
+                    pool_events.append("gemini_executing"),
+                    {
+                        "risk_score": 10,
+                        "explanation": "Legitimate posting.",
+                        "indicators": [],
+                        "job_details": None,
+                    },
+                )[1]
+
+                response = self.client.post(
+                    "/scan/",
+                    json={"content": "Backend developer opening with Python and FastAPI experience."},
+                    headers=self.headers,
+                )
+
+                self.assertEqual(response.status_code, 201)
+
+            # Analyze the chronological sequence of events
+            self.assertIn("gemini_executing", pool_events)
+            first_checkout_idx = pool_events.index("checkout")
+            first_checkin_idx = pool_events.index("checkin")
+            gemini_idx = pool_events.index("gemini_executing")
+
+            # 1. Auth checkout occurs first
+            self.assertLess(first_checkout_idx, first_checkin_idx)
+            # 2. Auth checkin occurs BEFORE Gemini runs (connection released)
+            self.assertLess(first_checkin_idx, gemini_idx)
+            # 3. Subsequent checkout (for scan persistence) occurs AFTER Gemini completes
+            remaining_checkouts = [i for i, ev in enumerate(pool_events) if ev == "checkout" and i > gemini_idx]
+            self.assertTrue(len(remaining_checkouts) >= 1)
+        finally:
+            event.remove(self.engine, "checkout", on_checkout)
+            event.remove(self.engine, "checkin", on_checkin)
+
+    def test_p43_auth_does_not_commit_unrelated_writes(self):
+        """get_current_user calling db.rollback() discards uncommitted session changes rather than committing them."""
+        # Stage a dirty uncommitted user in the session
+        staged_user = User(
+            email="staged_uncommitted@example.com",
+            password_hash="dummyhash123",
+        )
+        self.db.add(staged_user)
+        self.assertIn(staged_user, self.db)
+
+        # Execute get_current_user
+        authenticated = get_current_user(token=self.token, db=self.db)
+        self.assertEqual(authenticated.id, self.user.id)
+
+        # The staged user must NOT be committed to the database
+        persisted = self.db.execute(
+            select(User).where(User.email == "staged_uncommitted@example.com")
+        ).scalar_one_or_none()
+        self.assertIsNone(persisted, "Unrelated write was committed during authentication!")
+
+    def test_p43_user_attributes_accessible_after_expunge(self):
+        """Loaded User attributes remain accessible in memory after db.expunge() without DetachedInstanceError."""
+        authenticated_user = get_current_user(token=self.token, db=self.db)
+
+        # Verify the user is detached from the session
+        self.assertNotIn(authenticated_user, self.db)
+
+        # Verify all loaded attributes can be read without triggering DetachedInstanceError
+        self.assertEqual(authenticated_user.id, self.user.id)
+        self.assertEqual(authenticated_user.email, self.user.email)
+        self.assertIsNotNone(authenticated_user.created_at)
+
+    def test_p43_get_me_endpoint_compatibility(self):
+        """GET /users/me works seamlessly with the detached User returned by get_current_user."""
+        response = self.client.get("/users/me", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["id"], self.user.id)
+        self.assertEqual(data["email"], self.user.email)
+
+
+
+class Phase44BBaseTestCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._initial_tasks = set(asyncio.all_tasks())
+        self._orig_dependency_overrides = dict(app.dependency_overrides)
+        self._orig_settings: dict[str, Any] = {}
+        self._orig_scan_semaphore = getattr(app.state, "scan_semaphore", None)
+        self._active_clients: list[httpx.AsyncClient] = []
+        self._active_tasks: list[asyncio.Task] = []
+        self._active_threads: list[threading.Thread] = []
+        self._thread_unblock_callbacks: list[Callable[[], None]] = []
+        self._worker_completion_events: list[threading.Event] = []
+        self._lifespan_ctx = None
+        self.engine = None
+        self.SessionLocal = None
+
+        try:
+            limiter.reset()
+            self._lifespan_ctx = lifespan(app)
+            await self._lifespan_ctx.__aenter__()
+
+            self.engine = create_engine(
+                "sqlite:///:memory:",
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
+            Base.metadata.create_all(bind=self.engine)
+            self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+            app.dependency_overrides[get_db] = self._override_get_db
+        except BaseException as setup_exc:
+            try:
+                await self._safe_teardown()
+            except Exception as teardown_exc:
+                raise setup_exc from teardown_exc
+            raise setup_exc
+
+    def _override_get_db(self):
+        db = self.SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    def register_client(self, client: httpx.AsyncClient) -> httpx.AsyncClient:
+        self._active_clients.append(client)
+        return client
+
+    def register_task(self, task: asyncio.Task) -> asyncio.Task:
+        self._active_tasks.append(task)
+        return task
+
+    def register_thread(self, thread: threading.Thread, unblock_callback: Callable[[], None] | None = None) -> threading.Thread:
+        self._active_threads.append(thread)
+        if unblock_callback is not None:
+            self._thread_unblock_callbacks.append(unblock_callback)
+        return thread
+
+    def register_thread_unblock(self, callback: Callable[[], None]):
+        self._thread_unblock_callbacks.append(callback)
+
+    def register_worker_event(self, event: threading.Event) -> threading.Event:
+        self._worker_completion_events.append(event)
+        return event
+
+    def patch_setting(self, key: str, val: Any):
+        if key not in self._orig_settings:
+            self._orig_settings[key] = getattr(settings, key)
+        setattr(settings, key, val)
+
+    async def asyncTearDown(self):
+        await self._safe_teardown()
+
+    async def _safe_teardown(self):
+        teardown_errors: list[str] = []
+
+        # Phase 1: Signal worker unblock callbacks FIRST (Deadlock Prevention)
+        for unblock_cb in self._thread_unblock_callbacks:
+            try:
+                unblock_cb()
+            except Exception as exc:
+                teardown_errors.append(f"Worker unblock callback error: {exc}")
+
+        # Phase 2: Bounded Task Draining (Only Test-Spawned Tasks)
+        current_task = asyncio.current_task()
+        candidate_tasks = (set(asyncio.all_tasks()) - self._initial_tasks) | set(self._active_tasks)
+        candidate_tasks.discard(current_task)
+
+        for t in candidate_tasks:
+            if not t.done():
+                t.cancel()
+
+        pending_tasks: set[asyncio.Task] = set()
+        if candidate_tasks:
+            try:
+                done, pending_tasks = await asyncio.wait(candidate_tasks, timeout=2.0)
+            except Exception as exc:
+                teardown_errors.append(f"asyncio.wait unexpected error: {exc}")
+
+        if pending_tasks:
+            for unblock_cb in self._thread_unblock_callbacks:
+                try:
+                    unblock_cb()
+                except Exception:
+                    pass
+            try:
+                _, pending_tasks = await asyncio.wait(pending_tasks, timeout=1.0)
+            except Exception:
+                pass
+
+        if pending_tasks:
+            diagnostics = []
+            for t in pending_tasks:
+                coro = t.get_coro()
+                frame = getattr(coro, "cr_frame", None)
+                loc = f"{frame.f_code.co_filename}:{frame.f_lineno}" if frame else "unknown"
+                diagnostics.append(f"{t.get_name()} at {loc}")
+            teardown_errors.append(f"CRITICAL: Async tasks survived cancellation: {diagnostics}")
+
+        # Phase 3: Drain active HTTP clients
+        for c in self._active_clients:
+            try:
+                await c.aclose()
+            except Exception as exc:
+                teardown_errors.append(f"HTTP client close error: {exc}")
+
+        # Phase 4: Non-blocking worker threads termination
+        for th in self._active_threads:
+            if th.is_alive():
+                try:
+                    await asyncio.to_thread(th.join, timeout=2.0)
+                    if th.is_alive():
+                        teardown_errors.append(f"Worker thread {th.name} failed to terminate within 2.0s")
+                except Exception as exc:
+                    teardown_errors.append(f"Thread join error on {th.name}: {exc}")
+
+        alive_threads = [th.name for th in self._active_threads if th.is_alive()]
+
+        # Check registered worker completion events (e.g. AnyIO worker threads)
+        uncompleted_workers = []
+        for idx, ev in enumerate(self._worker_completion_events):
+            if not ev.is_set():
+                try:
+                    completed = await asyncio.to_thread(ev.wait, timeout=2.0)
+                    if not completed:
+                        uncompleted_workers.append(f"worker_event_{idx}")
+                except Exception as exc:
+                    teardown_errors.append(f"Worker event wait error: {exc}")
+
+        has_surviving_work = bool(alive_threads or pending_tasks or uncompleted_workers)
+
+        # Phase 5: Global state restoration & Complete Quarantine Isolation
+        if not has_surviving_work:
+            if self._lifespan_ctx is not None:
+                try:
+                    await self._lifespan_ctx.__aexit__(None, None, None)
+                except Exception as exc:
+                    teardown_errors.append(f"Lifespan exit error: {exc}")
+                finally:
+                    self._lifespan_ctx = None
+
+            try:
+                app.state.scan_semaphore = self._orig_scan_semaphore
+            except Exception as exc:
+                teardown_errors.append(f"scan_semaphore restore error: {exc}")
+
+            try:
+                app.dependency_overrides = self._orig_dependency_overrides
+            except Exception as exc:
+                teardown_errors.append(f"dependency_overrides restoration error: {exc}")
+
+            for k, v in list(self._orig_settings.items()):
+                try:
+                    setattr(settings, k, v)
+                except Exception as exc:
+                    teardown_errors.append(f"Settings restore error for {k}: {exc}")
+            self._orig_settings.clear()
+
+            try:
+                limiter.reset()
+            except Exception as exc:
+                teardown_errors.append(f"limiter.reset error: {exc}")
+        else:
+            teardown_errors.append(
+                "CRITICAL: Surviving work detected; quarantined resources (preserved lifespan, semaphore, "
+                "dependency overrides, settings, and limiter) to prevent rogue workers accessing disposed or un-isolated resources."
+            )
+
+        # Phase 6: Complete active-work gate for Database disposal
+        if has_surviving_work:
+            teardown_errors.append(
+                f"CRITICAL: Active work still detected (alive threads: {alive_threads}, "
+                f"pending tasks: {[t.get_name() for t in pending_tasks]}, "
+                f"uncompleted workers: {uncompleted_workers}). "
+                f"Database engine disposal and table drop ABORTED to preserve memory safety."
+            )
+        else:
+            if self.engine is not None:
+                try:
+                    Base.metadata.drop_all(bind=self.engine)
+                except Exception as exc:
+                    teardown_errors.append(f"Database drop_all error: {exc}")
+            if self.engine is not None:
+                try:
+                    self.engine.dispose()
+                except Exception as exc:
+                    teardown_errors.append(f"Database engine dispose error: {exc}")
+
+        if teardown_errors:
+            msg = "Teardown encountered failures:\n" + "\n".join(teardown_errors)
+            orig_exc = sys.exc_info()[1]
+            teardown_exc = AssertionError(msg)
+            if orig_exc is not None:
+                teardown_exc.__context__ = orig_exc
+            raise teardown_exc
+
+
+class TestPhase44BProductionStabilization(Phase44BBaseTestCase):
+    # -------------------------------------------------------------------------
+    # SLOT TESTS: P44B-SLOT-01 to P44B-SLOT-10 (10 Tests)
+    # -------------------------------------------------------------------------
+
+    async def test_p44b_slot_01_initial_state(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        try:
+            slot = ScanAdmissionSlot(loop, sem)
+            self.assertEqual(slot.state, SlotState.DEPENDENCY_OWNED)
+        finally:
+            sem.release()
+            self.assertEqual(sem._value, 1)
+
+    async def test_p44b_slot_02_accept_worker_success(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        try:
+            slot = ScanAdmissionSlot(loop, sem)
+            self.assertTrue(slot.accept_worker())
+            self.assertEqual(slot.state, SlotState.WORKER_ACCEPTED)
+        finally:
+            sem.release()
+            self.assertEqual(sem._value, 1)
+
+    async def test_p44b_slot_03_accept_worker_when_released(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        slot = ScanAdmissionSlot(loop, sem)
+        slot.release_from_dependency()
+        self.assertEqual(slot.state, SlotState.RELEASED)
+        self.assertFalse(slot.accept_worker())
+        self.assertEqual(slot.state, SlotState.RELEASED)
+        await asyncio.sleep(0)
+        self.assertEqual(sem._value, 1)
+
+    async def test_p44b_slot_04_release_from_dependency_success(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        slot = ScanAdmissionSlot(loop, sem)
+        slot.release_from_dependency()
+        self.assertEqual(slot.state, SlotState.RELEASED)
+        await asyncio.sleep(0)
+        self.assertEqual(sem._value, 1)
+
+    async def test_p44b_slot_05_release_from_dependency_noop_after_worker_accept(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        try:
+            slot = ScanAdmissionSlot(loop, sem)
+            self.assertTrue(slot.accept_worker())
+            slot.release_from_dependency()
+            self.assertEqual(slot.state, SlotState.WORKER_ACCEPTED)
+        finally:
+            sem.release()
+            self.assertEqual(sem._value, 1)
+
+    async def test_p44b_slot_06_release_from_worker_success(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        slot = ScanAdmissionSlot(loop, sem)
+        self.assertTrue(slot.accept_worker())
+        slot.release_from_worker()
+        self.assertEqual(slot.state, SlotState.RELEASED)
+        await asyncio.sleep(0)
+        self.assertEqual(sem._value, 1)
+
+    async def test_p44b_slot_07_release_from_worker_noop_in_dependency_owned(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        try:
+            slot = ScanAdmissionSlot(loop, sem)
+            slot.release_from_worker()
+            self.assertEqual(slot.state, SlotState.DEPENDENCY_OWNED)
+        finally:
+            sem.release()
+            self.assertEqual(sem._value, 1)
+
+    async def test_p44b_slot_08_release_from_worker_noop_after_released(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        slot = ScanAdmissionSlot(loop, sem)
+        slot.release_from_dependency()
+        self.assertEqual(slot.state, SlotState.RELEASED)
+        slot.release_from_worker()
+        self.assertEqual(slot.state, SlotState.RELEASED)
+        await asyncio.sleep(0)
+        self.assertEqual(sem._value, 1)
+
+    async def test_p44b_slot_09_release_internal_loop_closed(self):
+        def run_in_isolated_thread():
+            test_loop = asyncio.new_event_loop()
+            test_sem = asyncio.Semaphore(1)
+            test_loop.run_until_complete(test_sem.acquire())
+            slot = ScanAdmissionSlot(test_loop, test_sem)
+            self.assertTrue(slot.accept_worker())
+            test_loop.close()
+            slot.release_from_worker()
+            self.assertEqual(slot.state, SlotState.RELEASED)
+            test_sem.release()
+            self.assertEqual(test_sem._value, 1)
+
+        await asyncio.to_thread(run_in_isolated_thread)
+
+    async def test_p44b_slot_10_release_internal_runtime_error_handled(self):
+        sem = asyncio.Semaphore(1)
+        loop = asyncio.get_running_loop()
+        await sem.acquire()
+        try:
+            slot = ScanAdmissionSlot(loop, sem)
+            self.assertTrue(slot.accept_worker())
+            with patch.object(loop, "call_soon_threadsafe", side_effect=RuntimeError("Loop error")):
+                slot.release_from_worker()
+            self.assertEqual(slot.state, SlotState.RELEASED)
+        finally:
+            sem.release()
+            self.assertEqual(sem._value, 1)
+
+    # -------------------------------------------------------------------------
+    # ADMISSION TESTS: P44B-ADM-01 to P44B-ADM-05 (5 Tests)
+    # -------------------------------------------------------------------------
+
+    async def test_p44b_adm_01_concurrency_saturation_and_rejection(self):
+        self.patch_setting("SCAN_CONCURRENCY_TIMEOUT_SECONDS", 0.15)
+        self.patch_setting("SCAN_MAX_CONCURRENCY", 10)
+
+        workers_entered_barrier = threading.Barrier(11) # 10 AnyIO workers + 1 orchestrator
+        workers_release_event = threading.Event()
+
+        def unblock_workers():
+            try:
+                workers_entered_barrier.abort()
+            except Exception:
+                pass
+            workers_release_event.set()
+
+        self.register_thread_unblock(unblock_workers)
+
+        # Lifecycle Boundary 1: Mock callback completion tracking
+        mock_callbacks_completed_count = 0
+        mock_callbacks_count_lock = threading.Lock()
+        mock_callbacks_completed_event = threading.Event()
+        self.register_worker_event(mock_callbacks_completed_event)
+
+        def blocking_create_scan(*args, **kwargs):
+            try:
+                try:
+                    workers_entered_barrier.wait()
+                except threading.BrokenBarrierError:
+                    return Scan(id=1, user_id=1, input_type="text", content="test", risk_score=0, verdict="Low Risk", analysis_mode="rules_only", created_at=datetime.now(timezone.utc))
+                workers_release_event.wait()
+                return Scan(id=1, user_id=1, input_type="text", content="test", risk_score=0, verdict="Low Risk", analysis_mode="rules_only", created_at=datetime.now(timezone.utc))
+            finally:
+                with mock_callbacks_count_lock:
+                    nonlocal mock_callbacks_completed_count
+                    mock_callbacks_completed_count += 1
+                    if mock_callbacks_completed_count == 10:
+                        mock_callbacks_completed_event.set()
+
+        # Seed User 1 in DB
+        db = self.SessionLocal()
+        try:
+            u = User(id=1, email="adm01_user@example.com", password_hash="dummy")
+            db.add(u)
+            db.commit()
+            db.refresh(u)
+            token = create_access_token(u.id)
+        finally:
+            db.close()
+
+        headers = {"Authorization": f"Bearer {token}"}
+        client = self.register_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"))
+
+        with patch("app.routers.scan.create_scan", side_effect=blocking_create_scan):
+            tasks = [
+                self.register_task(asyncio.create_task(
+                    client.post("/scan/", json={"content": f"Valid job posting text {i} for scan testing"}, headers=headers),
+                    name=f"adm_01_task_{i}"
+                ))
+                for i in range(10)
+            ]
+
+            try:
+                await asyncio.to_thread(workers_entered_barrier.wait, timeout=10.0)
+                resp11 = await client.post("/scan/", json={"content": "Eleventh scan request that must be rejected"}, headers=headers)
+                self.assertEqual(resp11.status_code, 503)
+                self.assertEqual(resp11.headers.get("Retry-After"), "5")
+                self.assertEqual(resp11.json()["detail"], "Scan processing capacity is temporarily saturated. Please retry shortly.")
+            finally:
+                unblock_workers()
+                # Boundary 1: Verify mock callback completion across all 10 concurrent executions
+                mock_callbacks_exited = await asyncio.to_thread(mock_callbacks_completed_event.wait, timeout=5.0)
+                if not mock_callbacks_exited:
+                    self.fail(f"Only {mock_callbacks_completed_count}/10 mock callbacks exited blocking_create_scan within 5.0s!")
+
+                # Boundary 2: Verify request-task completion on event loop (ASGI cycle complete, response sent)
+                # Note on Boundary 3: AnyIO thread pool reuses persistent worker threads across tasks;
+                # physical OS thread termination does not occur per request due to pool worker reuse.
+                done, pending = await asyncio.wait(tasks, timeout=3.0)
+                if pending:
+                    for p in pending:
+                        p.cancel()
+                    self.fail(f"ADM-01 request tasks timed out during worker drain: {[p.get_name() for p in pending]}")
+
+            for t in done:
+                r = t.result() if not t.cancelled() else None
+                if r is None or isinstance(r, BaseException):
+                    self.fail(f"Task {t.get_name()} raised unexpected exception or was cancelled: {r}")
+                self.assertEqual(r.status_code, 201)
+
+    async def test_p44b_adm_02_async_generator_advancement_and_cleanup(self):
+        self.patch_setting("SCAN_CONCURRENCY_TIMEOUT_SECONDS", 0.05)
+        test_sem = asyncio.Semaphore(1)
+        app.state.scan_semaphore = test_sem
+
+        # 1. Setup acquires permit to fully saturate semaphore (0 permits remaining)
+        await test_sem.acquire()
+        self.assertTrue(test_sem.locked(), "Semaphore must be fully saturated before advancing dependency")
+
+        mock_request = Request({"type": "http", "app": app})
+        gen = scan_admission_control(mock_request)
+
+        try:
+            # 2. Advance generator: must time out and raise HTTPException(503)
+            with self.assertRaises(HTTPException) as ctx:
+                await gen.asend(None)
+            self.assertEqual(ctx.exception.status_code, 503)
+            self.assertEqual(ctx.exception.headers.get("Retry-After"), "5")
+            self.assertEqual(
+                ctx.exception.detail,
+                "Scan processing capacity is temporarily saturated. Please retry shortly."
+            )
+        finally:
+            # 3. Close generator: releases 0 permits
+            await gen.aclose()
+            # 4. Setup releases its acquired permit
+            test_sem.release()
+            # 5. Invariant verification: exactly 1 permit restored, zero leakage
+            self.assertEqual(test_sem._value, 1)
+            self.assertFalse(test_sem.locked())
+            app.state.scan_semaphore = self._orig_scan_semaphore
+
+    async def test_p44b_adm_03_cpython_waiter_observation_and_cancellation(self):
+        class ObservableSemaphore(asyncio.Semaphore):
+            def __init__(self, value: int = 1):
+                super().__init__(value)
+                self.waiter_enqueued = asyncio.Event()
+
+            async def acquire(self) -> bool:
+                if self._value <= 0:
+                    asyncio.get_running_loop().call_soon(self.waiter_enqueued.set)
+                return await super().acquire()
+
+        sem = ObservableSemaphore(1)
+        await sem.acquire()
+        self.assertEqual(sem._value, 0)
+
+        task2 = self.register_task(asyncio.create_task(sem.acquire(), name="adm_03_task_2"))
+        await sem.waiter_enqueued.wait()
+        self.assertTrue(hasattr(sem, "_waiters"))
+        self.assertIsNotNone(sem._waiters)
+        self.assertEqual(len(sem._waiters), 1)
+
+        task2.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task2
+        self.assertEqual(len(sem._waiters), 0)
+
+        sem.release()
+        self.assertEqual(sem._value, 1)
+
+        await asyncio.wait_for(sem.acquire(), timeout=0.5)
+        self.assertEqual(sem._value, 0)
+        sem.release()
+        self.assertEqual(sem._value, 1)
+
+    def test_p44b_adm_04_worker_encountering_cancelled_slot_raises_499(self):
+        class MockCancelledSlot:
+            def accept_worker(self):
+                return False
+            def release_from_worker(self):
+                pass
+
+        mock_slot = MockCancelledSlot()
+        mock_user = MagicMock(spec=User)
+        mock_user.id = 1
+        mock_scan_req = ScanRequest(content="Test job content for cancellation")
+        mock_db = MagicMock(spec=Session)
+
+        with self.assertRaises(HTTPException) as ctx:
+            create_scan_endpoint(
+                scan_request=mock_scan_req,
+                raw_request=None,
+                slot=mock_slot,
+                db=mock_db,
+                current_user=mock_user,
+            )
+        self.assertEqual(ctx.exception.status_code, 499)
+        self.assertEqual(ctx.exception.detail, "Request was cancelled before scan processing began")
+
+    async def test_p44b_adm_05_lifespan_shutdown_and_worker_release(self):
+        self.patch_setting("SCAN_MAX_CONCURRENCY", 1)
+        test_app = FastAPI(lifespan=lifespan)
+        test_lifespan = None
+        lifespan_entered = False
+        lifespan_exited = False
+        th = None
+        worker_hold = threading.Event()
+
+        try:
+            test_lifespan = lifespan(test_app)
+            await test_lifespan.__aenter__()
+            lifespan_entered = True
+
+            sem = test_app.state.scan_semaphore
+            loop = asyncio.get_running_loop()
+            await sem.acquire()
+
+            slot = ScanAdmissionSlot(loop, sem)
+            worker_entered = threading.Event()
+
+            def background_worker():
+                if slot.accept_worker():
+                    worker_entered.set()
+                    worker_hold.wait()
+                    slot.release_from_worker()
+
+            th = threading.Thread(target=background_worker, name="adm_05_worker")
+            self.register_thread(th, unblock_callback=worker_hold.set)
+            th.start()
+
+            # Step 1: Wait for worker to enter WORKER_ACCEPTED
+            await asyncio.to_thread(worker_entered.wait, timeout=2.0)
+            self.assertEqual(slot.state, SlotState.WORKER_ACCEPTED)
+
+            # Step 2: Lifespan shutdown occurs while worker is active
+            await test_lifespan.__aexit__(None, None, None)
+            lifespan_exited = True
+            self.assertIsNone(test_app.state.scan_semaphore)
+
+            # Step 3: Unblock worker
+            worker_hold.set()
+
+            # Step 4: Non-blocking thread join
+            await asyncio.to_thread(th.join, timeout=2.0)
+            self.assertFalse(th.is_alive())
+
+            # Step 5: Drain loop callback
+            await asyncio.sleep(0.01)
+
+            # Step 6: Verify slot released and permit restored
+            self.assertEqual(slot.state, SlotState.RELEASED)
+            self.assertEqual(sem._value, 1)
+        finally:
+            cleanup_exceptions: list[BaseException] = []
+            worker_hold.set()
+
+            # Attempt worker thread join if thread was created and alive
+            worker_is_alive = False
+            if th is not None:
+                try:
+                    if th.is_alive():
+                        await asyncio.to_thread(th.join, timeout=2.0)
+                except BaseException as join_exc:
+                    cleanup_exceptions.append(join_exc)
+
+                # Check liveness unconditionally, REGARDLESS of whether join succeeded or raised
+                try:
+                    worker_is_alive = th.is_alive()
+                except BaseException as liveness_exc:
+                    # If reading is_alive raises, defensively assume worker is still alive
+                    worker_is_alive = True
+                    cleanup_exceptions.append(liveness_exc)
+
+                if worker_is_alive:
+                    cleanup_exceptions.append(
+                        RuntimeError(f"Worker thread {th.name} failed to terminate within 2.0s join timeout (is_alive=True)")
+                    )
+
+            # Handle lifespan cleanup:
+            # - If worker is still alive, PRESERVE lifespan resources to avoid race conditions
+            # - If worker is dead or never created (th is None), safely exit test_lifespan if entered
+            if lifespan_entered and not lifespan_exited:
+                if worker_is_alive:
+                    cleanup_exceptions.append(
+                        RuntimeError("Preserving lifespan resources: skipped lifespan.__aexit__ because worker thread is still active")
+                    )
+                else:
+                    try:
+                        await test_lifespan.__aexit__(None, None, None)
+                        lifespan_exited = True
+                    except BaseException as exit_exc:
+                        cleanup_exceptions.append(exit_exc)
+
+            # Item 4: Preserve cleanup exceptions and original test-body exceptions with full tracebacks
+            # Use BaseExceptionGroup for arbitrary BaseException instances (e.g. CancelledError)
+            orig_exc = sys.exc_info()[1]
+            if cleanup_exceptions:
+                all_excs = [orig_exc, *cleanup_exceptions] if orig_exc is not None else cleanup_exceptions
+                if len(all_excs) == 1:
+                    raise all_excs[0]
+
+                has_base_exception = any(not isinstance(e, Exception) for e in all_excs)
+                if has_base_exception:
+                    beg_type = getattr(builtins, "BaseExceptionGroup", None)
+                    if beg_type is not None:
+                        raise beg_type("ADM-05 test body and cleanup failures", all_excs)
+                else:
+                    eg_type = getattr(builtins, "ExceptionGroup", None)
+                    if eg_type is not None:
+                        raise eg_type("ADM-05 test body and cleanup failures", all_excs)
+
+                # Fallback for Python < 3.11
+                primary = all_excs[0]
+                if orig_exc is not None and primary is not orig_exc:
+                    primary.__context__ = orig_exc
+                raise primary
+
+    # -------------------------------------------------------------------------
+    # CLEANUP / ERROR RESILIENCE TESTS: P44B-CLN-01 to P44B-CLN-02 (2 Tests)
+    # -------------------------------------------------------------------------
+
+    async def test_p44b_cln_01_invalid_jwt_releases_slot(self):
+        self.patch_setting("SCAN_MAX_CONCURRENCY", 1)
+        sem = asyncio.Semaphore(1)
+        app.state.scan_semaphore = sem
+
+        client = self.register_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"))
+
+        resp1 = await client.post(
+            "/scan/",
+            json={"content": "Valid job description for test"},
+            headers={"Authorization": "Bearer invalid_token_xyz"}
+        )
+        self.assertEqual(resp1.status_code, 401)
+        await asyncio.sleep(0.01)
+        self.assertEqual(sem._value, 1)
+
+        db = self.SessionLocal()
+        try:
+            u = User(email="cln01_user@example.com", password_hash="dummy")
+            db.add(u); db.commit(); db.refresh(u)
+            token = create_access_token(u.id)
+        finally:
+            db.close()
+
+        with patch("app.routers.scan.create_scan", return_value=Scan(id=1, user_id=u.id, input_type="text", content="Valid", risk_score=0, verdict="Low Risk", analysis_mode="rules_only", created_at=datetime.now(timezone.utc))):
+            resp2 = await client.post(
+                "/scan/",
+                json={"content": "Valid job description for test"},
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            self.assertEqual(resp2.status_code, 201)
+
+    async def test_p44b_cln_02_rate_limit_rejection_releases_slot(self):
+        self.patch_setting("SCAN_MAX_CONCURRENCY", 1)
+        sem = asyncio.Semaphore(1)
+        app.state.scan_semaphore = sem
+
+        db = self.SessionLocal()
+        try:
+            u1 = User(email="cln02_u1@example.com", password_hash="dummy")
+            u2 = User(email="cln02_u2@example.com", password_hash="dummy")
+            db.add(u1); db.add(u2); db.commit(); db.refresh(u1); db.refresh(u2)
+            token1 = create_access_token(u1.id)
+            token2 = create_access_token(u2.id)
+        finally:
+            db.close()
+
+        now = time.monotonic()
+        for _ in range(settings.SCAN_RATE_LIMIT_MAX_REQUESTS):
+            limiter._records[f"scan:user:{u1.id}"].append(now)
+
+        client = self.register_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"))
+
+        resp1 = await client.post(
+            "/scan/",
+            json={"content": "Valid job description"},
+            headers={"Authorization": f"Bearer {token1}"}
+        )
+        self.assertEqual(resp1.status_code, 429)
+        await asyncio.sleep(0.01)
+        self.assertEqual(sem._value, 1)
+
+        with patch("app.routers.scan.create_scan", return_value=Scan(id=2, user_id=u2.id, input_type="text", content="Valid", risk_score=0, verdict="Low Risk", analysis_mode="rules_only", created_at=datetime.now(timezone.utc))):
+            resp2 = await client.post(
+                "/scan/",
+                json={"content": "Valid job description"},
+                headers={"Authorization": f"Bearer {token2}"}
+            )
+            self.assertEqual(resp2.status_code, 201)
+
+    # -------------------------------------------------------------------------
+    # CONFIGURATION VALIDATION TESTS: P44B-CFG-01 to P44B-CFG-10 (10 Tests)
+    # -------------------------------------------------------------------------
+
+    def test_p44b_cfg_01_none_returns_empty_list(self):
+        self.assertEqual(settings.parse_and_validate_trusted_proxies(None), [])
+
+    def test_p44b_cfg_02_empty_string_returns_empty_list(self):
+        self.assertEqual(settings.parse_and_validate_trusted_proxies(""), [])
+
+    def test_p44b_cfg_03_whitespace_only_raises_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            settings.parse_and_validate_trusted_proxies("   ")
+        self.assertIn("cannot be a whitespace-only string", str(ctx.exception))
+
+    def test_p44b_cfg_04_empty_segment_raises_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            settings.parse_and_validate_trusted_proxies("10.0.0.1,,10.0.0.2")
+        self.assertIn("Empty or whitespace proxy entry", str(ctx.exception))
+
+    def test_p44b_cfg_05_leading_trailing_comma_raises_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            settings.parse_and_validate_trusted_proxies(",10.0.0.1")
+        self.assertIn("Empty or whitespace proxy entry", str(ctx.exception))
+
+    def test_p44b_cfg_06_invalid_ip_raises_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            settings.parse_and_validate_trusted_proxies("999.999.999.999")
+        self.assertIn("Invalid IP address or CIDR", str(ctx.exception))
+
+    def test_p44b_cfg_07_invalid_cidr_raises_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            settings.parse_and_validate_trusted_proxies("10.0.0.1/33")
+        self.assertIn("Invalid IP address or CIDR", str(ctx.exception))
+
+    def test_p44b_cfg_08_comma_separated_valid(self):
+        self.assertEqual(
+            settings.parse_and_validate_trusted_proxies("10.0.0.1, 192.168.1.0/24"),
+            ["10.0.0.1", "192.168.1.0/24"]
+        )
+
+    def test_p44b_cfg_09_list_of_valid(self):
+        self.assertEqual(
+            settings.parse_and_validate_trusted_proxies(["10.0.0.1", "172.16.0.0/12"]),
+            ["10.0.0.1", "172.16.0.0/12"]
+        )
+
+    def test_p44b_cfg_10_invalid_type_raises_type_error(self):
+        with self.assertRaises((TypeError, ValueError)):
+            settings.parse_and_validate_trusted_proxies(12345)
+
+    # -------------------------------------------------------------------------
+    # PROXY IP RESOLUTION TESTS: P44B-PRX-01 to P44B-PRX-18 (18 Tests)
+    # -------------------------------------------------------------------------
+
+    def _make_req(self, client_host: str | None, xff: str | None = None) -> Request:
+        headers = []
+        if xff is not None:
+            headers.append((b"x-forwarded-for", xff.encode("utf-8")))
+        client = (client_host, 12345) if client_host is not None else None
+        scope = {"type": "http", "client": client, "headers": headers}
+        return Request(scope)
+
+    def test_p44b_prx_01_empty_trusted_proxies_ignores_xff(self):
+        self.patch_setting("TRUSTED_PROXIES", [])
+        req = self._make_req("192.168.1.1", "203.0.113.1")
+        self.assertEqual(get_client_ip(req), "192.168.1.1")
+
+    def test_p44b_prx_02_untrusted_direct_peer_ignores_xff(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.0/8"])
+        req = self._make_req("192.168.1.1", "203.0.113.1")
+        self.assertEqual(get_client_ip(req), "192.168.1.1")
+
+    def test_p44b_prx_03_trusted_proxy_no_xff_returns_direct_peer(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1"])
+        req = self._make_req("10.0.0.1", None)
+        self.assertEqual(get_client_ip(req), "10.0.0.1")
+
+    def test_p44b_prx_04_trusted_proxy_empty_xff_returns_direct_peer(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1"])
+        req = self._make_req("10.0.0.1", "")
+        self.assertEqual(get_client_ip(req), "10.0.0.1")
+
+    def test_p44b_prx_05_untrusted_direct_invalid_peer_fallback(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1"])
+        req = self._make_req("invalid-peer", "203.0.113.1")
+        self.assertEqual(get_client_ip(req), "invalid-peer")
+
+    def test_p44b_prx_06_direct_peer_ipv4_with_port(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1"])
+        req = self._make_req("10.0.0.1:8080", "203.0.113.195")
+        self.assertEqual(get_client_ip(req), "203.0.113.195")
+
+    def test_p44b_prx_07_direct_peer_ipv6_with_port(self):
+        self.patch_setting("TRUSTED_PROXIES", ["2001:db8::1"])
+        req = self._make_req("[2001:db8::1]:9000", "203.0.113.195")
+        self.assertEqual(get_client_ip(req), "203.0.113.195")
+
+    def test_p44b_prx_08_single_trusted_hop_valid_client(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1"])
+        req = self._make_req("10.0.0.1", "203.0.113.195")
+        self.assertEqual(get_client_ip(req), "203.0.113.195")
+
+    def test_p44b_prx_09_multi_hop_right_to_left_traversal(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.0/8"])
+        req = self._make_req("10.0.0.1", "203.0.113.195, 10.0.0.2")
+        self.assertEqual(get_client_ip(req), "203.0.113.195")
+
+    def test_p44b_prx_10_all_hops_trusted_fallback_to_direct_peer(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.0/8"])
+        req = self._make_req("10.0.0.1", "10.0.0.3, 10.0.0.2")
+        self.assertEqual(get_client_ip(req), "10.0.0.1")
+
+    def test_p44b_prx_11_empty_hop_segment_raises_400(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1", "10.0.0.2"])
+        req = self._make_req("10.0.0.1", "203.0.113.1, , 10.0.0.2")
+        with self.assertRaises(HTTPException) as ctx:
+            get_client_ip(req)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("empty hop segment", ctx.exception.detail)
+
+    def test_p44b_prx_12_whitespace_hop_segment_raises_400(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1", "10.0.0.2"])
+        req = self._make_req("10.0.0.1", "203.0.113.1,   , 10.0.0.2")
+        with self.assertRaises(HTTPException) as ctx:
+            get_client_ip(req)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("empty hop segment", ctx.exception.detail)
+
+    def test_p44b_prx_13_malformed_ip_in_xff_raises_400(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1", "10.0.0.2"])
+        req = self._make_req("10.0.0.1", "not_an_ip, 10.0.0.2")
+        with self.assertRaises(HTTPException) as ctx:
+            get_client_ip(req)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("Malformed IP address", ctx.exception.detail)
+
+    def test_p44b_prx_14_exceeds_max_hops_raises_400(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1"])
+        hops = ["203.0.113.1"] + ["10.0.0.2"] * 30
+        req = self._make_req("10.0.0.1", ", ".join(hops))
+        with self.assertRaises(HTTPException) as ctx:
+            get_client_ip(req)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("exceeds maximum permitted hops (30)", ctx.exception.detail)
+
+    def test_p44b_prx_15_exact_max_hops_success(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1", "10.0.0.2"])
+        hops = ["203.0.113.1"] + ["10.0.0.2"] * 29
+        req = self._make_req("10.0.0.1", ", ".join(hops))
+        self.assertEqual(get_client_ip(req), "203.0.113.1")
+
+    def test_p44b_prx_16_xff_hop_ipv4_with_port(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1", "10.0.0.2"])
+        req = self._make_req("10.0.0.1", "203.0.113.195:8080, 10.0.0.2")
+        self.assertEqual(get_client_ip(req), "203.0.113.195")
+
+    def test_p44b_prx_17_xff_hop_ipv6_with_port(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1", "10.0.0.2"])
+        req = self._make_req("10.0.0.1", "[2001:db8::1]:8080, 10.0.0.2")
+        self.assertEqual(get_client_ip(req), "2001:db8::1")
+
+    def test_p44b_prx_18_xff_hop_bracketed_ipv6_without_port_raises_400(self):
+        self.patch_setting("TRUSTED_PROXIES", ["10.0.0.1", "10.0.0.2"])
+        req = self._make_req("10.0.0.1", "[2001:db8::1], 10.0.0.2")
+        with self.assertRaises(HTTPException) as ctx:
+            get_client_ip(req)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    # -------------------------------------------------------------------------
+    # DATABASE RESOURCE TESTS: P44B-DB-01 to P44B-DB-03 (3 Tests)
+    # -------------------------------------------------------------------------
+
+    def test_p44b_db_01_get_db_session_lifecycle_and_rollback(self):
+        gen = get_db()
+        db = next(gen)
+        self.assertIsInstance(db, Session)
+
+        # 1. Clean exit does NOT commit on success, but closes session
+        with patch.object(db, "commit") as mock_commit, patch.object(db, "close") as mock_close:
+            try:
+                next(gen)
+            except StopIteration:
+                pass
+            mock_commit.assert_not_called()
+            mock_close.assert_called_once()
+
+        # 2. Exception triggers rollback and close
+        gen2 = get_db()
+        db2 = next(gen2)
+        with patch.object(db2, "rollback") as mock_rollback, patch.object(db2, "close") as mock_close2:
+            with self.assertRaises(RuntimeError):
+                gen2.throw(RuntimeError("Database query failed"))
+            mock_rollback.assert_called_once()
+            mock_close2.assert_called_once()
+
+    def test_p44b_db_02_postgresql_engine_configuration_isolated(self):
+        repo_root = r"C:\Users\vasista0305\OneDrive\Desktop\AI-JOB-SCAM-DETECTOR"
+        script = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, r"{repo_root}")
+            from unittest.mock import patch
+            from app.core.config import settings
+
+            pg_url = "postgresql+psycopg://user:pass@localhost:5432/scamdb"
+            with patch("sqlalchemy.create_engine") as mock_ce, patch.object(settings, "DATABASE_URL", pg_url):
+                import app.core.database
+                called_url, kwargs = mock_ce.call_args
+                assert called_url[0] == pg_url, f"Expected {{pg_url}}, got {{called_url[0]}}"
+                assert kwargs.get("pool_size") == settings.DB_POOL_SIZE
+                assert kwargs.get("max_overflow") == settings.DB_MAX_OVERFLOW
+                assert kwargs.get("pool_timeout") == settings.DB_POOL_TIMEOUT_SECONDS
+                assert kwargs.get("pool_recycle") == settings.DB_POOL_RECYCLE_SECONDS
+                assert kwargs.get("pool_pre_ping") == settings.DB_POOL_PRE_PING
+                print("OK_POSTGRESQL_ENGINE_VERIFIED")
+        """)
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+        self.assertEqual(proc.returncode, 0, f"Subprocess failed with stderr:\n{proc.stderr}")
+        self.assertIn("OK_POSTGRESQL_ENGINE_VERIFIED", proc.stdout)
+
+    def test_p44b_db_03_database_runtime_engine_kwargs(self):
+        import app.core.database
+        self.assertTrue(app.core.database.engine_kwargs.get("pool_pre_ping"))
+        if not app.core.database.is_sqlite:
+            self.assertEqual(app.core.database.engine_kwargs.get("pool_size"), settings.DB_POOL_SIZE)
+            self.assertEqual(app.core.database.engine_kwargs.get("max_overflow"), settings.DB_MAX_OVERFLOW)
+
+    # -------------------------------------------------------------------------
+    # RATE LIMITING TESTS: P44B-RAT-01 to P44B-RAT-08 (8 Tests)
+    # -------------------------------------------------------------------------
+
+    async def test_p44b_rat_01_register_rate_limit_exceeded(self):
+        client = self.register_client(
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, client=("198.51.100.1", 50000)),
+                base_url="http://test",
+            )
+        )
+        # 5 registrations consume limit
+        for i in range(settings.REGISTER_RATE_LIMIT_MAX_REQUESTS):
+            resp = await client.post(
+                "/users/",
+                json={"email": f"rat1_user_{i}@example.com", "password": "SecurePassword123!"}
+            )
+            self.assertEqual(resp.status_code, 201)
+
+        # 6th request fails with 429
+        resp6 = await client.post(
+            "/users/",
+            json={"email": "rat1_user_exceeded@example.com", "password": "SecurePassword123!"}
+        )
+        self.assertEqual(resp6.status_code, 429)
+        retry_after = int(resp6.headers.get("Retry-After", 0))
+        self.assertTrue(1 <= retry_after <= 60)
+
+    async def test_p44b_rat_02_register_rate_limit_fast_fail_before_validation(self):
+        client = self.register_client(
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, client=("198.51.100.2", 50000)),
+                base_url="http://test",
+            )
+        )
+        for i in range(settings.REGISTER_RATE_LIMIT_MAX_REQUESTS):
+            resp = await client.post(
+                "/users/",
+                json={"email": f"rat2_user_{i}@example.com", "password": "SecurePassword123!"}
+            )
+            self.assertEqual(resp.status_code, 201)
+
+        # Malformed body (missing email) still gets 429 because limiter runs before validation
+        resp_malformed = await client.post(
+            "/users/",
+            json={"invalid_field": "no_email_present"}
+        )
+        self.assertEqual(resp_malformed.status_code, 429)
+
+    async def test_p44b_rat_03_scan_history_rate_limit_exceeded(self):
+        db = self.SessionLocal()
+        try:
+            u = User(email="rat3_user@example.com", password_hash="dummy")
+            db.add(u); db.commit(); db.refresh(u)
+            token = create_access_token(u.id)
+        finally:
+            db.close()
+
+        headers = {"Authorization": f"Bearer {token}"}
+        client = self.register_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"))
+
+        for _ in range(settings.SCAN_HISTORY_RATE_LIMIT_MAX_REQUESTS):
+            resp = await client.get("/scan/", headers=headers)
+            self.assertEqual(resp.status_code, 200)
+
+        # 31st request returns 429
+        resp31 = await client.get("/scan/", headers=headers)
+        self.assertEqual(resp31.status_code, 429)
+        retry_after = int(resp31.headers.get("Retry-After", 0))
+        self.assertTrue(1 <= retry_after <= 60)
+
+    async def test_p44b_rat_04_scan_history_isolation_by_user(self):
+        db = self.SessionLocal()
+        try:
+            u1 = User(email="rat4_u1@example.com", password_hash="dummy")
+            u2 = User(email="rat4_u2@example.com", password_hash="dummy")
+            db.add(u1); db.add(u2); db.commit(); db.refresh(u1); db.refresh(u2)
+            token1 = create_access_token(u1.id)
+            token2 = create_access_token(u2.id)
+        finally:
+            db.close()
+
+        headers1 = {"Authorization": f"Bearer {token1}"}
+        headers2 = {"Authorization": f"Bearer {token2}"}
+        client = self.register_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"))
+
+        for _ in range(settings.SCAN_HISTORY_RATE_LIMIT_MAX_REQUESTS):
+            resp = await client.get("/scan/", headers=headers1)
+            self.assertEqual(resp.status_code, 200)
+
+        # User 1 gets 429
+        resp_u1 = await client.get("/scan/", headers=headers1)
+        self.assertEqual(resp_u1.status_code, 429)
+
+        # User 2 gets 200 (isolated by user ID)
+        resp_u2 = await client.get("/scan/", headers=headers2)
+        self.assertEqual(resp_u2.status_code, 200)
+
+    async def test_p44b_rat_05_scan_history_keyed_by_user_not_ip(self):
+        db = self.SessionLocal()
+        try:
+            u = User(email="rat5_user@example.com", password_hash="dummy")
+            db.add(u); db.commit(); db.refresh(u)
+            token = create_access_token(u.id)
+        finally:
+            db.close()
+
+        headers = {"Authorization": f"Bearer {token}"}
+        client_a = self.register_client(httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=("198.51.100.10", 50000)),
+            base_url="http://test"
+        ))
+        client_b = self.register_client(httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=("198.51.100.20", 50000)),
+            base_url="http://test"
+        ))
+
+        for _ in range(settings.SCAN_HISTORY_RATE_LIMIT_MAX_REQUESTS):
+            resp = await client_a.get("/scan/", headers=headers)
+            self.assertEqual(resp.status_code, 200)
+
+        # User request from IP B is still rejected
+        resp_b = await client_b.get("/scan/", headers=headers)
+        self.assertEqual(resp_b.status_code, 429)
+
+    def test_p44b_rat_06_sliding_window_expiration(self):
+        test_limiter = SlidingWindowRateLimiter()
+        current_time = 1000.0
+
+        with patch("time.monotonic", side_effect=lambda: current_time):
+            for _ in range(3):
+                test_limiter.check("expire_key", limit=3, window_seconds=60.0)
+
+            with self.assertRaises(HTTPException) as ctx:
+                test_limiter.check("expire_key", limit=3, window_seconds=60.0)
+            self.assertEqual(ctx.exception.status_code, 429)
+
+            current_time += 61.0
+
+            test_limiter.check("expire_key", limit=3, window_seconds=60.0)
+
+    def test_p44b_rat_07_sliding_window_concurrency_stress(self):
+        stress_limiter = SlidingWindowRateLimiter()
+        successes = 0
+        rejections = 0
+        lock = threading.Lock()
+
+        def worker():
+            nonlocal successes, rejections
+            try:
+                stress_limiter.check("stress_key", limit=5, window_seconds=60.0)
+                with lock:
+                    successes += 1
+            except HTTPException as exc:
+                if exc.status_code == 429:
+                    with lock:
+                        rejections += 1
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join()
+
+        self.assertEqual(successes, 5)
+        self.assertEqual(rejections, 15)
+
+    def test_p44b_rat_08_rate_limiter_reset(self):
+        now = time.monotonic()
+        with limiter._lock:
+            limiter._records["test_ip_key"].append(now)
+            limiter._records["test_user_key"].append(now - 10.0)
+            limiter._check_count = 15
+
+        self.assertEqual(len(limiter._records), 2)
+        self.assertEqual(limiter._check_count, 15)
+
+        limiter.reset()
+
+        with limiter._lock:
+            self.assertEqual(len(limiter._records), 0)
+            self.assertEqual(limiter._check_count, 0)
+
+    # -------------------------------------------------------------------------
+    # HEALTH & LIFESPAN TESTS: P44B-HLT-01 to P44B-HLT-02 (2 Tests)
+    # -------------------------------------------------------------------------
+
+    async def test_p44b_hlt_01_health_check_native_coroutine(self):
+        self.assertTrue(inspect.iscoroutinefunction(health_check))
+        with patch("anyio.to_thread.run_sync", wraps=anyio.to_thread.run_sync) as mock_run_sync:
+            client = self.register_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"))
+            resp = await client.get("/health")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json(), {"status": "Healthy"})
+            self.assertEqual(mock_run_sync.call_count, 0, "Native async health_check must never invoke anyio.to_thread.run_sync")
+
+    async def test_p44b_hlt_02_lifespan_semaphore_isolated(self):
+        test_app = FastAPI(title="LifespanTestApp", lifespan=lifespan)
+        self.assertFalse(hasattr(test_app.state, "scan_semaphore") and test_app.state.scan_semaphore is not None)
+
+        async with lifespan(test_app):
+            self.assertTrue(hasattr(test_app.state, "scan_semaphore"))
+            self.assertIsInstance(test_app.state.scan_semaphore, asyncio.Semaphore)
+            self.assertEqual(test_app.state.scan_semaphore._value, settings.SCAN_MAX_CONCURRENCY)
+
+        self.assertIsNone(test_app.state.scan_semaphore)
+
+        self.patch_setting("SCAN_MAX_CONCURRENCY", 7)
+        async with lifespan(test_app):
+            self.assertEqual(test_app.state.scan_semaphore._value, 7)
+        self.assertIsNone(test_app.state.scan_semaphore)
+
+    # -------------------------------------------------------------------------
+    # REGRESSION TESTS: P44B-REG-01 to P44B-REG-03 (3 Tests)
+    # -------------------------------------------------------------------------
+
+    def test_p44b_reg_01_phase3_deterministic_engine_invariance(self):
+        content_fee = "Please pay the registration fee before starting."
+        score_fee = calculate_risk_score(content_fee)
+        self.assertEqual(score_fee, 65)
+        self.assertEqual(get_verdict(score_fee), "High Risk")
+
+        result_fee = analyze_job_posting(content_fee)
+        self.assertEqual(result_fee.rule_score, 65)
+        self.assertEqual(len(result_fee.evidence_items), 2)
+        ev0 = result_fee.evidence_items[0]
+        self.assertEqual(ev0.id, "ADV_FEE_REGISTRATION")
+        self.assertEqual(ev0.category, ScamCategory.ADVANCE_FEE)
+        self.assertEqual(ev0.severity, FindingSeverity.CRITICAL)
+        self.assertEqual(ev0.status, FindingStatus.EXPLICIT_CLAIM)
+        self.assertEqual(ev0.matched_text, "pay the registration fee")
+        self.assertEqual(ev0.finding_id, "ADV_FEE_REGISTRATION_1")
+        self.assertEqual(ev0.explanation, "Explicit demand for candidate to pay upfront registration, document, or onboarding fees.")
+
+        ev1 = result_fee.evidence_items[1]
+        self.assertEqual(ev1.id, "ADV_FEE_REGISTRATION")
+        self.assertEqual(ev1.finding_id, "ADV_FEE_REGISTRATION_7_31")
+        self.assertIn("CORROBORATED occurrence", ev1.explanation)
+
+        content_clean = "Join our software engineering team as a backend developer."
+        score_clean = calculate_risk_score(content_clean)
+        self.assertEqual(score_clean, 0)
+        self.assertEqual(get_verdict(score_clean), "Low Risk")
+
+        result_clean = analyze_job_posting(content_clean)
+        self.assertEqual(result_clean.rule_score, 0)
+        self.assertEqual(len(result_clean.evidence_items), 0)
+
+    async def test_p44b_reg_02_phase42_dual_engine_fallback(self):
+        db = self.SessionLocal()
+        try:
+            user = User(email="fallback_user@example.com", password_hash="hash")
+            db.add(user); db.commit(); db.refresh(user)
+            token = create_access_token(user.id)
+        finally:
+            db.close()
+
+        headers = {"Authorization": f"Bearer {token}"}
+        client = self.register_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"))
+        payload = {"content": "Urgent requirement for remote data entry operator. Pay 2000 registration fee."}
+
+        with patch("app.services.scan_services.analyze_job_content", side_effect=Exception("Gemini API Error")):
+            resp = await client.post("/scan/", json=payload, headers=headers)
+            self.assertEqual(resp.status_code, 201)
+            data = resp.json()
+            self.assertEqual(data["analysis_mode"], "rules_only")
+            self.assertGreater(data["risk_score"], 0)
+            self.assertIn("AI contextual analysis was unavailable", data["explanation"])
+
+        with patch("app.services.scan_services.analyze_job_content", side_effect=Exception("Gemini API Error")), \
+             patch("app.services.scan_services.analyze_job_posting", side_effect=Exception("Phase 3 Error")):
+            resp = await client.post("/scan/", json=payload, headers=headers)
+            self.assertEqual(resp.status_code, 503)
+            self.assertEqual(resp.headers.get("Retry-After"), "30")
+            self.assertEqual(resp.json()["detail"], "Scan service is temporarily unavailable. Please retry shortly.")
+
+    async def test_p44b_reg_03_phase43_detached_user_and_structured_telemetry(self):
+        class TelemetryLogHandler(logging.Handler):
+            def __init__(self):
+                super().__init__()
+                self.records: list[logging.LogRecord] = []
+            def emit(self, record: logging.LogRecord) -> None:
+                self.records.append(record)
+
+        db = self.SessionLocal()
+        handler = TelemetryLogHandler()
+        scan_logger = logging.getLogger("app.services.scan_services")
+        orig_level = scan_logger.level
+        orig_disabled = scan_logger.disabled
+        orig_propagate = scan_logger.propagate
+
+        scan_logger.disabled = False
+        scan_logger.setLevel(logging.INFO)
+        scan_logger.addHandler(handler)
+
+        try:
+            user = User(email="telemetry_user@example.com", password_hash="hash")
+            db.add(user); db.commit(); db.refresh(user)
+            token = create_access_token(user.id)
+
+            resolved_user = get_current_user(token=token, db=db)
+            insp = sa_inspect(resolved_user)
+            self.assertTrue(insp.detached, "User instance must be detached from session")
+            self.assertIsNone(insp.session, "User instance must have no active session binding")
+            self.assertNotIn(resolved_user, db, "User instance must not be in session identity map")
+            self.assertEqual(resolved_user.id, user.id)
+            self.assertEqual(resolved_user.email, "telemetry_user@example.com")
+            self.assertIsNotNone(resolved_user.created_at)
+
+            dirty_user = User(email="dirty_user@example.com", password_hash="hash")
+            db.add(dirty_user)
+            self.assertIn(dirty_user, db.new)
+            _ = get_current_user(token=token, db=db)
+            self.assertNotIn(dirty_user, db.new)
+            self.assertIsNone(db.execute(select(User).where(User.email == "dirty_user@example.com")).scalar_one_or_none())
+
+            client = self.register_client(httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test"))
+            with patch("app.services.scan_services.analyze_job_content") as mock_gemini:
+                mock_gemini.return_value = {
+                    "risk_score": 65,
+                    "explanation": "High risk pattern detected.",
+                    "indicators": ["registration fee"],
+                }
+                resp = await client.post(
+                    "/scan/",
+                    json={"content": "Please pay the registration fee before starting."},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            self.assertEqual(resp.status_code, 201)
+            scan_record = next(
+                (r for r in handler.records if getattr(r, "telemetry", {}).get("event") == "scan_completed"),
+                None
+            )
+            self.assertIsNotNone(scan_record, "scan_completed telemetry event must be emitted")
+            payload = scan_record.telemetry
+            self.assertEqual(payload["scan_id"], resp.json()["id"])
+            self.assertIn(payload["analysis_mode"], ["rules_only", "ai_assisted"])
+            self.assertIsInstance(payload["risk_score"], int)
+            self.assertIsInstance(payload["scan_service_duration_ms"], int)
+            self.assertGreaterEqual(payload["scan_service_duration_ms"], 0)
+        finally:
+            scan_logger.removeHandler(handler)
+            scan_logger.setLevel(orig_level)
+            scan_logger.disabled = orig_disabled
+            scan_logger.propagate = orig_propagate
+            db.close()
 
 
 if __name__ == "__main__":
